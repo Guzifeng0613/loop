@@ -22,7 +22,7 @@ export function Inspector({ controller, onEditDocument }: { controller: LoopCont
       <div className="inspector-content">
         {tab === 'docs' ? (
           <>
-            <div className="inspector-intro"><div><strong>规范门禁</strong><span>{data.currentRun?.docsApproved ? '已批准，可进入执行' : '变更会使任务引用失效'}</span></div><span className={`gate-icon ${data.currentRun?.docsApproved ? 'approved' : ''}`}>{data.currentRun?.docsApproved ? <Check size={15} /> : <ShieldAlert size={15} />}</span></div>
+            <div className="inspector-intro"><div><span>当前门禁</span><strong>规范文档</strong><small>{data.currentRun?.docsApproved ? '版本与哈希已冻结' : '变更会使任务引用失效'}</small></div><span className={`gate-icon ${data.currentRun?.docsApproved ? 'approved' : ''}`}>{data.currentRun?.docsApproved ? <Check size={15} /> : <ShieldAlert size={15} />}</span></div>
             <div className="document-list">
               {data.documents.map((doc) => (
                 <button key={doc.id} className="document-row" onClick={() => onEditDocument(doc)}>

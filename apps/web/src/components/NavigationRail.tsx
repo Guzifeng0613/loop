@@ -1,16 +1,17 @@
-import { Bot, GitBranch, LayoutDashboard, ListChecks, Settings2 } from 'lucide-react';
+import { Code2, LayoutDashboard, ListChecks, Settings2 } from 'lucide-react';
 import type { ViewMode } from '@loop/contracts';
+import { LoopLogo } from './LoopLogo';
 
 const views: { id: ViewMode; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'workbench', label: '工作台', icon: LayoutDashboard },
   { id: 'flow', label: '流程', icon: ListChecks },
-  { id: 'ide', label: 'IDE', icon: GitBranch }
+  { id: 'ide', label: 'IDE', icon: Code2 }
 ];
 
 export function NavigationRail({ view, onView, onSettings }: { view: ViewMode; onView: (view: ViewMode) => void; onSettings: () => void }) {
   return (
     <nav className="navigation-rail" aria-label="主导航">
-      <div className="brand-mark" title="Loop"><Bot size={22} strokeWidth={1.8} /></div>
+      <div className="brand-mark" title="Loop"><LoopLogo compact /></div>
       <div className="rail-items">
         {views.map(({ id, label, icon: Icon }) => (
           <button key={id} className={`rail-button ${view === id ? 'active' : ''}`} onClick={() => onView(id)} aria-label={label} title={label}>
@@ -26,4 +27,3 @@ export function NavigationRail({ view, onView, onSettings }: { view: ViewMode; o
     </nav>
   );
 }
-
