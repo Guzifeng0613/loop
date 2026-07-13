@@ -6,13 +6,14 @@ import type {
   Agent,
   AppSettings,
   ChatMessage,
+  Checkpoint,
   Project,
   Run,
   TaskSpec,
   UnderstandingAnalysis
 } from '@loop/contracts';
-import type { DocumentService } from './documents.js';
-import type { ProviderRegistry } from './providers.js';
+import { coreFiles, type DocumentService, validateCoreDocuments } from './documents.js';
+import { completeWithRetry, type ProviderRegistry } from './providers.js';
 import type { LoopStore } from './store.js';
 import { WorkspaceTools, type WorkspaceToolName } from './workspace-tools.js';
 import type { WorktreeManager } from './worktrees.js';
@@ -72,8 +73,8 @@ function analysisPrompt(): string {
 区分事实与假设；问题只保留会改变方案的重要事项；不要声称已经执行工具。`;
 }
 
-function taskPrompt(): string {
-  return `你是 Loop 的 Lead Main。根据批准文档把工作拆成 3 到 8 个可独立验证的任务。只输出 JSON：
+function taskPrompt(limit: number): string {
+  return `你是 Loop 的 Lead Main。根据批准文档把工作拆成不超过 ${limit} 个可独立验证的任务。只输出 JSON：
 {"tasks":[{"title":"任务名","description":"具体交付","scope":["允许修改的路径"],"acceptanceCriteria":["可执行的验收条件"],"providerId":"openai或deepseek","model":"可选模型ID"}]}
 任务需要覆盖共享契约、后端、前端和验证；只有自动路由模式才填写 providerId；不要添加文档之外的需求。`;
 }
@@ -81,6 +82,7 @@ function taskPrompt(): string {
 export class Orchestrator {
   private readonly tools = new WorkspaceTools();
   private readonly activeRuns = new Set<string>();
+  private readonly runControllers = new Map<string, AbortController>();
 
   constructor(
     private readonly store: LoopStore,
@@ -88,6 +90,27 @@ export class Orchestrator {
     private readonly providers: ProviderRegistry,
     private readonly worktrees: WorktreeManager
   ) {}
+
+  interrupt(runId: string): void {
+    this.runControllers.get(runId)?.abort();
+  }
+
+  private assertRunnable(runId: string, signal?: AbortSignal): Run {
+    if (signal?.aborted) throw new Error('RUN_INTERRUPTED');
+    const run = this.requireRun(runId);
+    if (['paused', 'cancelled', 'failed', 'doc_review'].includes(run.state)) throw new Error('RUN_INTERRUPTED');
+    return run;
+  }
+
+  private assertDocumentReferences(projectId: string, task: TaskSpec): void {
+    const current = new Map(this.store.listDocuments(projectId).map((document) => [document.id, document]));
+    for (const reference of task.docRefs) {
+      const document = current.get(reference.docId);
+      if (!document || document.status !== 'approved' || document.hash !== reference.hash || document.version !== reference.version) {
+        throw new Error(`DOC_VERSION_STALE: 任务 ${task.id} 引用的文档 ${reference.docId} 已过期`);
+      }
+    }
+  }
 
   private assertBudget(run: Run): void {
     const settings = this.store.getSetting<AppSettings>('app');
@@ -121,6 +144,9 @@ export class Orchestrator {
 
   async sendMessage(runId: string, content: string): Promise<ChatMessage> {
     const run = this.requireRun(runId);
+    if (['decomposing', 'executing', 'integrating', 'verifying', 'optimizing', 'completed', 'cancelled'].includes(run.state)) {
+      throw new Error(`RUN_STATE_CONFLICT: ${run.state} 状态不能进入需求澄清`);
+    }
     this.store.addMessage({ runId, role: 'user', content });
     this.store.updateRun(runId, { state: 'clarifying', previousState: run.state, docsApproved: false });
 
@@ -131,7 +157,17 @@ export class Orchestrator {
     } else {
       this.assertBudget(run);
       const history = this.store.listMessages(runId).slice(-16).map(({ role, content: messageContent }) => ({ role, content: messageContent }));
-      const result = await provider.completeTurn({ model: run.model, systemPrompt: analysisPrompt(), messages: history, jsonMode: true });
+      let result;
+      try {
+        result = await completeWithRetry(provider, { model: run.model, systemPrompt: analysisPrompt(), messages: history, jsonMode: true });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.startsWith('PROVIDER_NOT_CONFIGURED') || message.startsWith('PROVIDER_RATE_LIMITED')) {
+          const current = this.requireRun(runId);
+          this.store.updateRun(runId, { state: 'paused', previousState: current.state, pauseReason: message });
+        }
+        throw error;
+      }
       this.store.addUsage(runId, result.inputTokens, result.outputTokens);
       const parsed = analysisSchema.parse(extractJson(result.text));
       analysis = { ...parsed, source: 'model' };
@@ -148,16 +184,40 @@ export class Orchestrator {
 
   async approveAllDocuments(runId: string): Promise<Run> {
     const run = this.requireRun(runId);
+    if (['decomposing', 'executing', 'integrating', 'verifying', 'optimizing', 'completed', 'cancelled', 'failed'].includes(run.state)) {
+      throw new Error(`RUN_STATE_CONFLICT: ${run.state} 状态不能批准文档`);
+    }
     const project = this.requireProject(run.projectId);
     await this.documents.syncProject(project.id, project.rootPath);
     const docs = this.store.listDocuments(project.id);
-    if (docs.length === 0) throw new Error('DOCS_NOT_FOUND');
-    for (const doc of docs) this.store.approveDocument(project.id, doc.id);
+    if (docs.length !== coreFiles.length) throw new Error('DOCS_NOT_FOUND: 五份核心文档尚未齐全');
+    const documentErrors = validateCoreDocuments(docs);
+    if (documentErrors.length > 0) throw new Error(`DOCS_NOT_APPROVED: ${documentErrors.join('；')}`);
+    this.store.approveDocuments(project.id, docs.map((document) => document.id));
     return this.store.updateRun(runId, { docsApproved: true, state: 'ready', previousState: run.state });
+  }
+
+  async approveDocument(runId: string, docId: string): Promise<{ document: ReturnType<LoopStore['approveDocument']>; run: Run }> {
+    const run = this.requireRun(runId);
+    if (['decomposing', 'executing', 'integrating', 'verifying', 'optimizing', 'completed', 'cancelled', 'failed'].includes(run.state)) {
+      throw new Error(`RUN_STATE_CONFLICT: ${run.state} 状态不能批准文档`);
+    }
+    const project = this.requireProject(run.projectId);
+    await this.documents.syncProject(project.id, project.rootPath);
+    const documentErrors = validateCoreDocuments(this.store.listDocuments(project.id));
+    if (documentErrors.length > 0) throw new Error(`DOCS_NOT_APPROVED: ${documentErrors.join('；')}`);
+    const document = this.store.approveDocument(project.id, docId);
+    const approved = this.store.documentsApproved(project.id, coreFiles.length);
+    const nextRun = this.store.updateRun(runId, approved
+      ? { docsApproved: true, state: 'ready', previousState: run.state, pauseReason: null }
+      : { docsApproved: false, state: 'doc_review', previousState: run.state });
+    return { document, run: nextRun };
   }
 
   async invalidateForDocumentChange(runId: string, docId: string): Promise<void> {
     const run = this.requireRun(runId);
+    if (['completed', 'cancelled', 'failed'].includes(run.state)) return;
+    this.interrupt(runId);
     this.store.updateRun(runId, { docsApproved: false, state: 'doc_review', previousState: run.state, pauseReason: `文档 ${docId} 已改变` });
     for (const task of this.store.listTasks(runId)) {
       if (task.status !== 'completed') this.store.upsertTask({ ...task, status: 'stale' });
@@ -167,42 +227,78 @@ export class Orchestrator {
 
   async execute(runId: string): Promise<void> {
     if (this.activeRuns.has(runId)) return;
-    const run = this.requireRun(runId);
+    let run = this.requireRun(runId);
     const project = this.requireProject(run.projectId);
-    if (!run.docsApproved) throw new Error('DOCS_NOT_APPROVED');
+    if (!['ready', 'decomposing', 'executing'].includes(run.state)) {
+      throw new Error(`RUN_STATE_CONFLICT: ${run.state} 状态不能开始执行`);
+    }
+    await this.documents.syncProject(project.id, project.rootPath);
+    run = this.requireRun(runId);
+    if (
+      validateCoreDocuments(this.store.listDocuments(project.id)).length > 0 ||
+      !run.docsApproved ||
+      !this.store.documentsApproved(project.id, coreFiles.length)
+    ) {
+      throw new Error('DOCS_NOT_APPROVED: 核心文档未全部批准或内容已经改变');
+    }
     if (!project.isGit) throw new Error('PROJECT_NOT_GIT');
     if (!(await this.worktrees.isClean(project.rootPath))) throw new Error('WORKTREE_DIRTY');
+    const controller = new AbortController();
     this.activeRuns.add(runId);
-    void this.runExecution(run, project).finally(() => this.activeRuns.delete(runId));
+    this.runControllers.set(runId, controller);
+    void this.runExecution(run, project, controller.signal).finally(() => {
+      this.activeRuns.delete(runId);
+      this.runControllers.delete(runId);
+    });
   }
 
   async integrate(runId: string): Promise<void> {
+    if (this.activeRuns.has(runId)) throw new Error('RUN_STATE_CONFLICT: 运行已有活动执行器');
     const run = this.requireRun(runId);
     const project = this.requireProject(run.projectId);
+    await this.documents.syncProject(project.id, project.rootPath);
+    if (
+      validateCoreDocuments(this.store.listDocuments(project.id)).length > 0 ||
+      !run.docsApproved ||
+      !this.store.documentsApproved(project.id, coreFiles.length)
+    ) {
+      throw new Error('DOC_VERSION_STALE: 集成前核心文档已改变');
+    }
+    const controller = new AbortController();
+    this.activeRuns.add(runId);
+    this.runControllers.set(runId, controller);
     this.store.updateRun(runId, { state: 'integrating', previousState: run.state });
     try {
-      const result = await this.worktrees.integrate(runId, project.rootPath);
+      const result = await this.worktrees.integrate(runId, project.rootPath, controller.signal);
       for (const output of result.verification) this.store.appendEvent(runId, 'tool.output', { tool: 'integration_verification', output });
       this.store.updateRun(runId, { state: 'optimizing', previousState: 'verifying' });
       this.store.appendEvent(runId, 'tool.output', { output: `集成分支 ${result.branch} 已完成验证，位置：${result.path}` });
       this.store.updateRun(runId, { state: 'completed', previousState: 'optimizing' });
     } catch (error) {
+      const current = this.requireRun(runId);
+      if (controller.signal.aborted || ['paused', 'cancelled', 'doc_review'].includes(current.state)) return;
       this.store.appendEvent(runId, 'error', { message: error instanceof Error ? error.message : String(error) });
       this.store.updateRun(runId, { state: 'paused', previousState: 'integrating', pauseReason: error instanceof Error ? error.message : String(error) });
       throw error;
+    } finally {
+      this.activeRuns.delete(runId);
+      this.runControllers.delete(runId);
     }
   }
 
-  private async runExecution(initialRun: Run, project: Project): Promise<void> {
+  private async runExecution(initialRun: Run, project: Project, signal: AbortSignal): Promise<void> {
     try {
+      this.assertRunnable(initialRun.id, signal);
       this.store.updateRun(initialRun.id, { state: 'decomposing', previousState: initialRun.state });
       let tasks = this.store.listTasks(initialRun.id);
-      if (tasks.length === 0) tasks = await this.decompose(initialRun, project);
+      if (tasks.length === 0) tasks = await this.decompose(initialRun, project, signal);
+      this.assertRunnable(initialRun.id, signal);
       this.store.updateRun(initialRun.id, { state: 'executing', previousState: 'decomposing' });
       const settings = this.store.getSetting<AppSettings>('app');
       if (!settings) throw new Error('SETTINGS_MISSING');
       let remaining = tasks.filter((task) => task.status !== 'completed');
       while (remaining.length > 0) {
+        this.assertRunnable(initialRun.id, signal);
         const latest = this.store.listTasks(initialRun.id);
         const completed = new Set(latest.filter((task) => task.status === 'completed').map((task) => task.id));
         const ready = remaining.filter((task) => task.dependencies.every((dependency) => completed.has(dependency)));
@@ -210,13 +306,15 @@ export class Orchestrator {
           this.store.updateRun(initialRun.id, { state: 'paused', previousState: 'executing', pauseReason: '任务依赖阻塞或等待审批' });
           return;
         }
-        await this.runPool(ready, settings.concurrency, (task) => this.executeTask(initialRun, project, task, settings));
+        await this.runPool(ready, settings.concurrency, (task) => this.executeTask(initialRun, project, task, settings, signal));
+        this.assertRunnable(initialRun.id, signal);
         remaining = this.store.listTasks(initialRun.id).filter((task) => task.status !== 'completed');
         if (remaining.some((task) => task.status === 'blocked')) {
           this.store.updateRun(initialRun.id, { state: 'paused', previousState: 'executing', pauseReason: '子 Agent 等待审批或人工输入' });
           return;
         }
       }
+      this.assertRunnable(initialRun.id, signal);
       if (this.store.listTasks(initialRun.id).some((task) => task.status !== 'completed')) return;
       this.store.updateRun(initialRun.id, { state: 'integrating', previousState: 'executing' });
       this.store.appendEvent(initialRun.id, 'tool.output', { output: '所有任务分支已完成，等待 Lead Main 集成。' });
@@ -231,29 +329,43 @@ export class Orchestrator {
       this.store.updateRun(initialRun.id, { state: 'paused', previousState: 'verifying', pauseReason: '等待最终集成批准' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const current = this.requireRun(initialRun.id);
+      if (signal.aborted || message.startsWith('RUN_INTERRUPTED') || ['paused', 'cancelled', 'doc_review'].includes(current.state)) return;
       this.store.appendEvent(initialRun.id, 'error', { message });
-      if (message.startsWith('BUDGET_EXCEEDED')) {
-        const current = this.requireRun(initialRun.id);
+      if (
+        message.startsWith('BUDGET_EXCEEDED') ||
+        message.startsWith('PROVIDER_RATE_LIMITED') ||
+        message.startsWith('PROVIDER_NOT_CONFIGURED') ||
+        message.startsWith('TASK_LEASE_CONFLICT')
+      ) {
         if (current.state !== 'paused') this.store.updateRun(initialRun.id, { state: 'paused', previousState: current.state, pauseReason: message });
+      } else if (message.startsWith('DOC_VERSION_STALE')) {
+        this.store.updateRun(initialRun.id, { state: 'doc_review', previousState: current.state, docsApproved: false, pauseReason: message });
+        for (const task of this.store.listTasks(initialRun.id).filter((item) => item.status !== 'completed')) {
+          this.store.upsertTask({ ...task, status: 'stale' });
+        }
       } else {
-        this.store.updateRun(initialRun.id, { state: 'failed', previousState: this.requireRun(initialRun.id).state, pauseReason: message });
+        this.store.updateRun(initialRun.id, { state: 'failed', previousState: current.state, pauseReason: message });
       }
     }
   }
 
-  private async decompose(run: Run, project: Project): Promise<TaskSpec[]> {
+  private async decompose(run: Run, project: Project, signal: AbortSignal): Promise<TaskSpec[]> {
     const docs = this.store.listDocuments(project.id);
     const docRefs = docs.map((doc) => ({ docId: doc.id, version: doc.version, hash: doc.hash, sections: [] }));
+    const settings = this.store.getSetting<AppSettings>('app');
+    if (!settings) throw new Error('SETTINGS_MISSING');
+    const directLimit = Math.min(settings.mainDirectLimit, settings.maxAgents);
     let taskInputs: z.infer<typeof taskSchema>[];
     const provider = await this.providers.get(run.providerId);
     if (provider) {
       this.assertBudget(run);
-      const result = await provider.completeTurn({
+      const result = await completeWithRetry(provider, {
         model: run.model,
-        systemPrompt: taskPrompt(),
+        systemPrompt: taskPrompt(directLimit),
         messages: [{ role: 'user', content: docs.map((doc) => doc.content).join('\n\n').slice(0, 120_000) }],
         jsonMode: true
-      });
+      }, signal);
       this.store.addUsage(run.id, result.inputTokens, result.outputTokens);
       taskInputs = z.object({ tasks: z.array(taskSchema).min(1).max(30) }).parse(extractJson(result.text)).tasks;
     } else {
@@ -265,6 +377,7 @@ export class Orchestrator {
         { title: '运行全局验收', description: '执行 lint、类型检查、测试与构建。', scope: ['.'], acceptanceCriteria: ['所有验收命令成功'] }
       ];
     }
+    if (taskInputs.length > directLimit) throw new Error(`AGENT_LIMIT_EXCEEDED: Lead Main 最多直属分发 ${directLimit} 个任务`);
     const leadId = randomUUID();
     const lead: Agent = {
       id: leadId, runId: run.id, name: 'Lead Main', role: 'lead-main', status: 'running', depth: 0,
@@ -297,9 +410,12 @@ export class Orchestrator {
     project: Project,
     task: TaskSpec,
     settings: AppSettings,
+    signal: AbortSignal,
     baseRef = 'HEAD',
     parentAgentId?: string
   ): Promise<void> {
+    this.assertRunnable(run.id, signal);
+    this.assertDocumentReferences(project.id, task);
     const blocked = task.dependencies.some((dependency) => this.store.listTasks(run.id).find((item) => item.id === dependency)?.status !== 'completed');
     if (blocked) return;
     const fallbackParentId = this.store.listAgents(run.id).find((item) => item.role === 'lead-main')?.id;
@@ -312,24 +428,39 @@ export class Orchestrator {
     };
     this.store.upsertAgent(agent);
     this.store.upsertTask({ ...task, status: 'running', assignedAgentId: agent.id });
-
-    const worktree = await this.worktrees.create(run.id, task.id, project.rootPath, baseRef);
-    const provider = await this.providers.get(agent.providerId);
-    if (!provider) {
-      await this.writeResult(worktree.path, run.id, agent, task, '本地演示模式完成了任务状态与结果文档验证；未调用模型或修改业务代码。', ['状态机已记录完成事件']);
-      await this.worktrees.commit(worktree.path, task.id);
-      this.store.upsertTask({ ...task, status: 'completed', assignedAgentId: agent.id });
-      this.store.upsertAgent({ ...agent, status: 'completed', contextUsage: 0.12 });
-      return;
+    let leaseAgentId = agent.id;
+    if (!this.store.acquireTaskLease(task.id, leaseAgentId)) {
+      this.store.upsertAgent({ ...agent, status: 'waiting' });
+      this.store.upsertTask({ ...task, status: 'blocked', assignedAgentId: agent.id });
+      throw new Error(`TASK_LEASE_CONFLICT: 任务 ${task.id} 已由另一 Agent 持有`);
     }
+    const leaseHeartbeat = setInterval(() => this.store.renewTaskLease(task.id, leaseAgentId), 60_000);
+    leaseHeartbeat.unref();
 
-    const conversation: Pick<ChatMessage, 'role' | 'content'>[] = [{
+    try {
+      const worktree = await this.worktrees.create(run.id, task.id, project.rootPath, baseRef, signal);
+      this.assertRunnable(run.id, signal);
+      const provider = await this.providers.get(agent.providerId);
+      if (!provider) {
+        await this.writeResult(worktree.path, run.id, agent, task, '本地演示模式完成了任务状态与结果文档验证；未调用模型或修改业务代码。', ['状态机已记录完成事件']);
+        this.assertRunnable(run.id, signal);
+        this.assertDocumentReferences(project.id, task);
+        await this.worktrees.commit(worktree.path, task.id, signal);
+        this.store.upsertTask({ ...task, status: 'completed', assignedAgentId: agent.id });
+        this.store.upsertAgent({ ...agent, status: 'completed', contextUsage: 0.12 });
+        return;
+      }
+
+      const conversation: Pick<ChatMessage, 'role' | 'content'>[] = [{
       role: 'user',
       content: `任务：${task.title}\n${task.description}\n允许作用域：${task.scope.join(', ')}\n验收：${task.acceptanceCriteria.join('; ')}`
     }];
-    let summary = '';
-    const evidence: string[] = [];
-    for (let step = 0; step < 8; step += 1) {
+      let summary = '';
+      const evidence: string[] = [];
+      for (let step = 0; step < 8; step += 1) {
+        this.assertRunnable(run.id, signal);
+        this.assertDocumentReferences(project.id, task);
+        if (!this.store.renewTaskLease(task.id, leaseAgentId)) throw new Error(`TASK_LEASE_CONFLICT: 任务 ${task.id} 的租约已丢失`);
       if (agent.contextUsage >= 0.75) {
         const previous = agent;
         await this.writeCheckpoint(worktree.path, run, previous, task, '继续当前任务的下一轮结构化动作');
@@ -345,10 +476,13 @@ export class Orchestrator {
         };
         this.store.upsertAgent(agent);
         this.store.upsertTask({ ...task, status: 'running', assignedAgentId: agent.id });
+        this.store.releaseTaskLease(task.id, leaseAgentId);
+        leaseAgentId = agent.id;
+        if (!this.store.acquireTaskLease(task.id, leaseAgentId)) throw new Error(`TASK_LEASE_CONFLICT: 无法接管任务 ${task.id} 的租约`);
         conversation.push({ role: 'system', content: `已通过 Markdown 检查点完成上下文接力，新实例 lineage=${agent.lineage}。` });
       }
       this.assertBudget(this.requireRun(run.id));
-      const result = await provider.completeTurn({
+      const result = await completeWithRetry(provider, {
         model: agent.model,
         systemPrompt: `你是文档驱动的编码子 Agent。每次只输出一个 JSON 动作。可用工具 list_files/read_file/search_text/write_file/run_command/git_status。
 工具动作：{"type":"call_tool","tool":"read_file","arguments":{"path":"..."}}
@@ -358,7 +492,7 @@ export class Orchestrator {
 不得修改任务 scope 外文件；最多向下委派 ${Math.max(0, settings.maxDepth - task.depth)} 层；先检查再修改；完成前运行验收命令。`,
         messages: conversation,
         jsonMode: true
-      });
+      }, signal);
       this.store.addUsage(run.id, result.inputTokens, result.outputTokens);
       const action = modelActionSchema.parse(extractJson(result.text));
       if (action.type === 'complete') {
@@ -380,7 +514,7 @@ export class Orchestrator {
           });
           continue;
         }
-        await this.worktrees.commit(worktree.path, `${task.id}-before-delegate`);
+        await this.worktrees.commit(worktree.path, `${task.id}-before-delegate`, signal);
         const childTasks = await Promise.all(action.tasks.map(async (input) => {
           const route = await this.selectRoute(run, input.providerId, input.model);
           const child: TaskSpec = {
@@ -402,7 +536,7 @@ export class Orchestrator {
           return child;
         }));
         await this.runPool(childTasks, Math.min(settings.concurrency, 5), (child) =>
-          this.executeTask(run, project, child, settings, worktree.branch, agent.id)
+          this.executeTask(run, project, child, settings, signal, worktree.branch, agent.id)
         );
         const incomplete = childTasks.filter((child) => this.store.listTasks(run.id).find((item) => item.id === child.id)?.status !== 'completed');
         if (incomplete.length > 0) {
@@ -410,7 +544,7 @@ export class Orchestrator {
           this.store.upsertAgent({ ...agent, status: 'waiting' });
           return;
         }
-        for (const child of childTasks) await this.worktrees.mergeInto(worktree.path, this.worktrees.branchName(run.id, child.id));
+        for (const child of childTasks) await this.worktrees.mergeInto(worktree.path, this.worktrees.branchName(run.id, child.id), signal);
         conversation.push({ role: 'assistant', content: JSON.stringify(action) }, {
           role: 'tool',
           content: `已完成并合并 ${childTasks.length} 个下级任务：${childTasks.map((child) => child.id).join(', ')}`
@@ -420,7 +554,8 @@ export class Orchestrator {
         continue;
       }
       const policy = this.tools.evaluate(action.tool as WorkspaceToolName, action.arguments, settings);
-      const approvalGranted = this.store.consumeApprovedTool(run.id, task.id, action.tool);
+      const approvalSummary = JSON.stringify(action.arguments).slice(0, 500);
+      const approvalGranted = this.store.consumeApprovedTool(run.id, task.id, action.tool, approvalSummary);
       if (policy.decision === 'deny') {
         this.store.upsertTask({ ...task, status: 'failed', assignedAgentId: agent.id });
         this.store.upsertAgent({ ...agent, status: 'failed' });
@@ -429,7 +564,7 @@ export class Orchestrator {
       if (policy.decision === 'approval' && !approvalGranted) {
         this.store.createApproval({
           runId: run.id, taskId: task.id, tool: action.tool, risk: policy.risk,
-          summary: JSON.stringify(action.arguments).slice(0, 500), policyReason: policy.reason
+          summary: approvalSummary, policyReason: policy.reason
         });
         this.store.upsertTask({ ...task, status: 'blocked', assignedAgentId: agent.id });
         this.store.upsertAgent({ ...agent, status: 'waiting', contextUsage: Math.min(0.7, (step + 1) / 10) });
@@ -438,28 +573,54 @@ export class Orchestrator {
       const idempotencyKey = `${run.id}:${task.id}:${step}:${action.tool}:${JSON.stringify(action.arguments)}`;
       let outcome = this.store.getIdempotent<Awaited<ReturnType<WorkspaceTools['execute']>>>(idempotencyKey);
       if (!outcome) {
-        outcome = await this.tools.execute(action.tool as WorkspaceToolName, action.arguments, { project, workspaceRoot: worktree.path, settings }, undefined, approvalGranted);
+        outcome = await this.tools.execute(action.tool as WorkspaceToolName, action.arguments, {
+          project,
+          workspaceRoot: worktree.path,
+          taskScope: task.scope,
+          settings
+        }, signal, approvalGranted);
         this.store.setIdempotent(idempotencyKey, outcome);
       }
+      if (outcome.policy.decision === 'deny') throw new Error(outcome.output);
       this.store.appendEvent(run.id, 'tool.output', { taskId: task.id, tool: action.tool, output: outcome.output.slice(0, 8_000) });
       conversation.push({ role: 'assistant', content: JSON.stringify(action) }, { role: 'tool', content: outcome.output });
       agent.contextUsage = Math.min(0.9, agent.contextUsage + 0.14);
       this.store.upsertAgent(agent);
     }
-    if (!summary) throw new Error(`AGENT_STEP_LIMIT: ${task.id}`);
-    await this.writeResult(worktree.path, run.id, agent, task, summary, evidence);
-    const revision = await this.worktrees.commit(worktree.path, task.id);
-    if (revision) evidence.push(`commit ${revision}`);
-    this.store.upsertTask({ ...task, status: 'completed', assignedAgentId: agent.id });
-    this.store.upsertAgent({ ...agent, status: 'completed', contextUsage: Math.min(0.75, agent.contextUsage) });
+      if (!summary) throw new Error(`AGENT_STEP_LIMIT: ${task.id}`);
+      this.assertRunnable(run.id, signal);
+      this.assertDocumentReferences(project.id, task);
+      await this.writeResult(worktree.path, run.id, agent, task, summary, evidence);
+      const revision = await this.worktrees.commit(worktree.path, task.id, signal);
+      if (revision) evidence.push(`commit ${revision}`);
+      this.store.upsertTask({ ...task, status: 'completed', assignedAgentId: agent.id });
+      this.store.upsertAgent({ ...agent, status: 'completed', contextUsage: Math.min(0.75, agent.contextUsage) });
+    } finally {
+      clearInterval(leaseHeartbeat);
+      this.store.releaseTaskLease(task.id, leaseAgentId);
+    }
   }
 
   private async writeCheckpoint(root: string, run: Run, agent: Agent, task: TaskSpec, nextAction: string): Promise<void> {
     const directory = resolve(root, 'docs', 'runs', run.id, 'handoffs');
     await mkdir(directory, { recursive: true });
-    const events = this.store.listEvents(run.id);
-    const eventWatermark = events.at(-1)?.id ?? 0;
-    const content = `---\nloop_schema: 1\nrun_id: ${run.id}\nagent_id: ${agent.id}\nlineage: ${agent.lineage}\nevent_watermark: ${eventWatermark}\nupdated_at: ${new Date().toISOString()}\n---\n\n# Agent 上下文交接\n\n## 当前任务\n\n- ${task.id}: ${task.title}\n- 状态：${task.status}\n- 文档版本：${task.docRefs.map((ref) => `${ref.docId}@${ref.version}`).join(', ')}\n\n## 模块状态与内容\n\n${task.description}\n\n## 验收与规划\n\n${task.acceptanceCriteria.map((item) => `- ${item}`).join('\n')}\n\n## 下一步\n\n${nextAction}\n`;
+    const eventWatermark = this.store.getEventWatermark(run.id);
+    const createdAt = new Date().toISOString();
+    const checkpoint: Checkpoint = {
+      id: randomUUID(),
+      runId: run.id,
+      agentId: agent.id,
+      lineage: agent.lineage,
+      docRefs: task.docRefs,
+      taskIds: [task.id],
+      eventWatermark,
+      decisions: [],
+      unresolved: task.status === 'blocked' ? [task.description] : [],
+      nextAction,
+      createdAt
+    };
+    this.store.upsertCheckpoint(checkpoint);
+    const content = `---\nloop_schema: 1\nrun_id: ${run.id}\nagent_id: ${agent.id}\nlineage: ${agent.lineage}\nevent_watermark: ${eventWatermark}\nupdated_at: ${createdAt}\n---\n\n# Agent 上下文交接\n\n## 当前任务\n\n- ${task.id}: ${task.title}\n- 状态：${task.status}\n- 文档版本：${task.docRefs.map((ref) => `${ref.docId}@${ref.version}`).join(', ')}\n\n## 模块状态与内容\n\n${task.description}\n\n## 验收与规划\n\n${task.acceptanceCriteria.map((item) => `- ${item}`).join('\n')}\n\n## 下一步\n\n${nextAction}\n`;
     await writeFile(resolve(directory, `${agent.id}-lineage-${agent.lineage}.md`), content, 'utf8');
   }
 

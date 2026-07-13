@@ -22,7 +22,7 @@ export class WorktreeManager {
     return `loop/${safeName(runId)}/${safeName(taskId)}`;
   }
 
-  async create(runId: string, taskId: string, projectRoot: string, baseRef = 'HEAD'): Promise<{ path: string; branch: string }> {
+  async create(runId: string, taskId: string, projectRoot: string, baseRef = 'HEAD', signal?: AbortSignal): Promise<{ path: string; branch: string }> {
     if (!(await this.isGit(projectRoot))) throw new Error('WORKTREE_NOT_GIT');
     if (!(await this.isClean(projectRoot))) throw new Error('WORKTREE_DIRTY');
     const runKey = safeName(runId);
@@ -36,48 +36,67 @@ export class WorktreeManager {
     } catch {
       // Create a new worktree below.
     }
-    const branchExists = (await runProcess(`git show-ref --verify --quiet 'refs/heads/${branch}'`, projectRoot)).code === 0;
+    const branchExists = (await runProcess(`git show-ref --verify --quiet 'refs/heads/${branch}'`, projectRoot, signal)).code === 0;
     const result = await runProcess(
       branchExists
         ? `git worktree add '${directory.replace(/'/g, "''")}' '${branch}'`
         : `git worktree add -b '${branch}' '${directory.replace(/'/g, "''")}' '${baseRef.replace(/'/g, "''")}'`,
-      projectRoot
+      projectRoot,
+      signal
     );
     if (result.code !== 0) throw new Error(`WORKTREE_CREATE_FAILED: ${result.output}`);
     return { path: directory, branch };
   }
 
-  async mergeInto(worktreePath: string, branch: string): Promise<void> {
-    const result = await runProcess(`git merge --no-ff '${branch.replace(/'/g, "''")}' -m 'loop: merge ${safeName(branch)}'`, worktreePath);
+  async mergeInto(worktreePath: string, branch: string, signal?: AbortSignal): Promise<void> {
+    const result = await runProcess(`git merge --no-ff '${branch.replace(/'/g, "''")}' -m 'loop: merge ${safeName(branch)}'`, worktreePath, signal);
     if (result.code !== 0) {
       await runProcess('git merge --abort', worktreePath);
       throw new Error(`WORKTREE_CONFLICT: ${branch}\n${result.output}`);
     }
   }
 
-  async commit(worktreePath: string, taskId: string): Promise<string | undefined> {
-    await runProcess('git add -A', worktreePath);
-    const status = await runProcess('git status --porcelain', worktreePath);
+  async commit(worktreePath: string, taskId: string, signal?: AbortSignal): Promise<string | undefined> {
+    await runProcess('git add -A', worktreePath, signal);
+    const status = await runProcess('git status --porcelain', worktreePath, signal);
     if (!status.output.trim()) return undefined;
-    const result = await runProcess(`git commit -m 'loop: complete ${safeName(taskId)}'`, worktreePath);
+    const result = await runProcess(`git commit -m 'loop: complete ${safeName(taskId)}'`, worktreePath, signal);
     if (result.code !== 0) throw new Error(`WORKTREE_COMMIT_FAILED: ${result.output}`);
-    const revision = await runProcess('git rev-parse HEAD', worktreePath);
+    const revision = await runProcess('git rev-parse HEAD', worktreePath, signal);
     return revision.output.trim();
   }
 
-  async integrate(runId: string, projectRoot: string): Promise<{ path: string; branch: string; verification: string[] }> {
+  async integrate(runId: string, projectRoot: string, signal?: AbortSignal): Promise<{ path: string; branch: string; verification: string[] }> {
+    if (!(await this.isGit(projectRoot))) throw new Error('PROJECT_NOT_GIT');
+    if (!(await this.isClean(projectRoot))) throw new Error('WORKTREE_DIRTY');
     const runKey = safeName(runId);
     const directory = resolve(this.worktreeRoot, runKey, '_integration');
     const branch = `loop/${runKey}/integration`;
     await mkdir(resolve(this.worktreeRoot, runKey), { recursive: true });
-    const create = await runProcess(`git worktree add -b ${branch} '${directory.replace(/'/g, "''")}' HEAD`, projectRoot);
-    if (create.code !== 0 && !/already exists/i.test(create.output)) {
-      throw new Error(`INTEGRATION_CREATE_FAILED: ${create.output}`);
+    let directoryExists = false;
+    try {
+      await stat(directory);
+      directoryExists = true;
+    } catch {
+      // Create or restore the integration worktree below.
     }
-    const branchesResult = await runProcess(`git for-each-ref --format='%(refname:short)' 'refs/heads/loop/${runKey}/*'`, projectRoot);
+    if (!directoryExists) {
+      const branchExists = (await runProcess(`git show-ref --verify --quiet 'refs/heads/${branch}'`, projectRoot, signal)).code === 0;
+      const create = await runProcess(
+        branchExists
+          ? `git worktree add '${directory.replace(/'/g, "''")}' '${branch}'`
+          : `git worktree add -b '${branch}' '${directory.replace(/'/g, "''")}' HEAD`,
+        projectRoot,
+        signal
+      );
+      if (create.code !== 0) throw new Error(`INTEGRATION_CREATE_FAILED: ${create.output}`);
+    } else if ((await runProcess('git rev-parse --is-inside-work-tree', directory, signal)).code !== 0) {
+      throw new Error('WORKTREE_CONFLICT: 集成目录存在但不是有效 Git worktree');
+    }
+    const branchesResult = await runProcess(`git for-each-ref --format='%(refname:short)' 'refs/heads/loop/${runKey}/*'`, projectRoot, signal);
     const branches = branchesResult.output.split(/\r?\n/).map((item) => item.trim()).filter((item) => item && item !== branch);
     for (const taskBranch of branches) {
-      const merge = await runProcess(`git merge --no-ff '${taskBranch.replace(/'/g, "''")}' -m 'loop: integrate ${safeName(taskBranch)}'`, directory);
+      const merge = await runProcess(`git merge --no-ff '${taskBranch.replace(/'/g, "''")}' -m 'loop: integrate ${safeName(taskBranch)}'`, directory, signal);
       if (merge.code !== 0) {
         await runProcess('git merge --abort', directory);
         throw new Error(`WORKTREE_CONFLICT: ${taskBranch}\n${merge.output}`);
@@ -85,7 +104,7 @@ export class WorktreeManager {
     }
     const verification: string[] = [];
     for (const command of ['npm.cmd run typecheck', 'npm.cmd test', 'npm.cmd run build']) {
-      const result = await runProcess(command, directory);
+      const result = await runProcess(command, directory, signal);
       verification.push(`${command}: ${result.code === 0 ? 'passed' : 'failed'}\n${result.output.slice(-4000)}`);
       if (result.code !== 0) throw new Error(`INTEGRATION_VERIFY_FAILED: ${command}\n${result.output}`);
     }
