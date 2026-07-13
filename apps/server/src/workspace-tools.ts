@@ -1,13 +1,14 @@
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, relative } from 'node:path';
 import type { AppSettings, Project } from '@loop/contracts';
-import { evaluateCommand, resolveProjectPath, runProcess, type PolicyDecision } from './security.js';
+import { evaluateCommand, pathWithinTaskScope, PathPolicyError, resolveProjectPath, runProcess, type PolicyDecision } from './security.js';
 
 export type WorkspaceToolName = 'list_files' | 'read_file' | 'search_text' | 'write_file' | 'run_command' | 'git_status';
 
 export interface ToolCallContext {
   project: Project;
   workspaceRoot?: string;
+  taskScope?: string[];
   settings: AppSettings;
 }
 
@@ -39,44 +40,59 @@ export class WorkspaceTools {
       ? { decision: 'allow', risk: evaluated.risk, reason: '用户已批准本次同类工具调用。' }
       : evaluated;
     if (policy.decision !== 'allow') return { ok: false, output: policy.reason, policy };
-
-    if (name === 'list_files') {
-      const target = await resolveProjectPath(root, String(args.path ?? '.'));
-      const entries = await readdir(target, { withFileTypes: true });
-      return {
-        ok: true,
-        output: entries.slice(0, 500).map((entry) => `${entry.isDirectory() ? 'dir ' : 'file'} ${entry.name}`).join('\n'),
-        policy
+    if (name === 'write_file' && context.taskScope && !pathWithinTaskScope(String(args.path ?? ''), context.taskScope)) {
+      const denied: PolicyDecision = {
+        decision: 'deny',
+        risk: 'high',
+        reason: '写入路径不在当前任务声明的作用域内。'
       };
+      return { ok: false, output: 'TOOL_SCOPE_VIOLATION: 写入路径不在当前任务作用域内。', policy: denied };
     }
 
-    if (name === 'read_file') {
-      const target = await resolveProjectPath(root, String(args.path ?? ''));
-      const content = await readFile(target, 'utf8');
-      const maxChars = Math.min(Number(args.maxChars ?? 80_000), 160_000);
-      return { ok: true, output: content.slice(0, maxChars), policy };
-    }
+    try {
+      if (name === 'list_files') {
+        const target = await resolveProjectPath(root, String(args.path ?? '.'));
+        const entries = await readdir(target, { withFileTypes: true });
+        return {
+          ok: true,
+          output: entries.slice(0, 500).map((entry) => `${entry.isDirectory() ? 'dir ' : 'file'} ${entry.name}`).join('\n'),
+          policy
+        };
+      }
 
-    if (name === 'search_text') {
-      const query = String(args.query ?? '');
-      if (!query) return { ok: false, output: 'query 不能为空', policy };
-      const escaped = query.replace(/'/g, "''");
-      const result = await runProcess(`rg --line-number --hidden --glob '!node_modules' --glob '!dist' -- '${escaped}' .`, root, signal);
-      return { ok: result.code === 0 || result.code === 1, output: result.output.slice(0, 80_000), policy };
-    }
+      if (name === 'read_file') {
+        const target = await resolveProjectPath(root, String(args.path ?? ''));
+        const content = await readFile(target, 'utf8');
+        const requestedMax = Number(args.maxChars ?? 80_000);
+        const maxChars = Number.isFinite(requestedMax) ? Math.max(1, Math.min(requestedMax, 160_000)) : 80_000;
+        return { ok: true, output: content.slice(0, maxChars), policy };
+      }
 
-    if (name === 'write_file') {
-      const target = await resolveProjectPath(root, String(args.path ?? ''), true);
-      const content = String(args.content ?? '');
-      await mkdir(dirname(target), { recursive: true });
-      const temp = `${target}.loop-tmp`;
-      await writeFile(temp, content, 'utf8');
-      await rename(temp, target);
-      return { ok: true, output: `已原子写入 ${relative(root, target)}（${content.length} 字符）`, policy };
-    }
+      if (name === 'search_text') {
+        const query = String(args.query ?? '');
+        if (!query) return { ok: false, output: 'query 不能为空', policy };
+        const escaped = query.replace(/'/g, "''");
+        const result = await runProcess(`rg --line-number --hidden --glob '!node_modules' --glob '!dist' -- '${escaped}' .`, root, signal);
+        return { ok: result.code === 0 || result.code === 1, output: result.output.slice(0, 80_000), policy };
+      }
 
-    const command = name === 'git_status' ? 'git status --short --branch' : String(args.command ?? '');
-    const result = await runProcess(command, root, signal);
-    return { ok: result.code === 0, output: result.output || `退出码 ${result.code}`, policy };
+      if (name === 'write_file') {
+        const target = await resolveProjectPath(root, String(args.path ?? ''), true);
+        const content = String(args.content ?? '');
+        await mkdir(dirname(target), { recursive: true });
+        const temp = `${target}.loop-tmp`;
+        await writeFile(temp, content, 'utf8');
+        await rename(temp, target);
+        return { ok: true, output: `已原子写入 ${relative(root, target)}（${content.length} 字符）`, policy };
+      }
+
+      const command = name === 'git_status' ? 'git status --short --branch' : String(args.command ?? '');
+      const result = await runProcess(command, root, signal);
+      return { ok: result.code === 0, output: result.output || `退出码 ${result.code}`, policy };
+    } catch (error) {
+      if (error instanceof PathPolicyError) throw error;
+      if (signal?.aborted) throw error;
+      return { ok: false, output: `TOOL_ERROR: ${error instanceof Error ? error.message : String(error)}`, policy };
+    }
   }
 }

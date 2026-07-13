@@ -34,7 +34,7 @@ describe('multi-agent orchestrator', () => {
     for (const [filename, id] of [
       ['总体方案.md', 'architecture'], ['功能.md', 'features'], ['UI.md', 'ui'], ['API接口.md', 'api'], ['版本更迭.md', 'roadmap']
     ]) {
-      await writeFile(resolve(root, 'docs', filename), `---\ndoc_id: ${id}\nversion: 0.1.0\nstatus: approved\n---\n\n# ${id}\n`, 'utf8');
+      await writeFile(resolve(root, 'docs', filename), `---\nloop_schema: 1\ndoc_id: ${id}\nversion: 0.1.0\nstatus: approved\n---\n\n# ${id}\n`, 'utf8');
     }
     expect((await runProcess('git init', root)).code).toBe(0);
     await runProcess("git config user.email 'loop@example.local'", root);

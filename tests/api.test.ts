@@ -70,4 +70,78 @@ describe('local REST API', () => {
     expect(response.json().title).toBe('new run');
     expect(context.store.listMessages(response.json().id)).toHaveLength(2);
   });
+
+  it('deduplicates writes and rejects reuse of an idempotency key with another payload', async () => {
+    context = await createApp(':memory:');
+    const payload = (await context.app.inject({ method: 'GET', url: '/api/bootstrap' })).json();
+    const body = {
+      projectId: payload.currentProject.id,
+      title: 'idempotent run',
+      question: '实现一个面向开发者、范围明确并带验收测试的本地工具。',
+      modelMode: 'fixed',
+      providerId: 'local-demo',
+      model: 'local-structured-demo'
+    };
+    const headers = { 'x-loop-session': payload.sessionToken, 'idempotency-key': 'create-run-1' };
+    const first = await context.app.inject({ method: 'POST', url: '/api/runs', headers, payload: body });
+    const replay = await context.app.inject({ method: 'POST', url: '/api/runs', headers, payload: body });
+
+    expect(first.statusCode).toBe(200);
+    expect(replay.json().id).toBe(first.json().id);
+    expect(context.store.listRuns(payload.currentProject.id)).toHaveLength(2);
+
+    const conflict = await context.app.inject({
+      method: 'POST', url: '/api/runs', headers, payload: { ...body, title: 'different run' }
+    });
+    expect(conflict.statusCode).toBe(409);
+    expect(conflict.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
+  it('supports the documented collection routes while preserving precise errors', async () => {
+    context = await createApp(':memory:');
+    const payload = (await context.app.inject({ method: 'GET', url: '/api/bootstrap' })).json();
+    const auth = { 'x-loop-session': payload.sessionToken };
+    const runId = payload.currentRun.id as string;
+    const document = payload.documents[0];
+
+    const saved = await context.app.inject({
+      method: 'PATCH', url: `/api/runs/${runId}/docs`, headers: auth,
+      payload: { docId: document.id, content: document.content }
+    });
+    expect(saved.statusCode).toBe(200);
+
+    for (const item of payload.documents) {
+      const approved = await context.app.inject({
+        method: 'POST', url: `/api/runs/${runId}/docs/${item.id}/approve`, headers: auth
+      });
+      expect(approved.statusCode).toBe(200);
+    }
+    expect(context.store.getRun(runId)?.state).toBe('ready');
+    expect(context.store.getRun(runId)?.docsApproved).toBe(true);
+
+    const approval = context.store.createApproval({
+      runId, tool: 'run_command', risk: 'high', summary: 'test', policyReason: 'test'
+    });
+    const resolved = await context.app.inject({
+      method: 'POST', url: `/api/runs/${runId}/approvals`, headers: auth,
+      payload: { approvalId: approval.id, decision: 'approved' }
+    });
+    expect(resolved.statusCode).toBe(200);
+    expect(context.store.listApprovals(runId).find((item) => item.id === approval.id)?.status).toBe('approved');
+
+    const settings = await context.app.inject({
+      method: 'PATCH', url: '/api/settings', headers: auth,
+      payload: { concurrency: 4, budget: { maxCalls: 12, maxMinutes: 30 } }
+    });
+    expect(settings.statusCode).toBe(200);
+    expect(settings.json().budget.maxCalls).toBe(12);
+    expect(settings.json().budget.maxInputTokens).toBe(5_000_000);
+
+    const invalid = await context.app.inject({
+      method: 'PATCH', url: '/api/settings', headers: auth, payload: { concurrency: 99 }
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json().error.code).toBe('INVALID_REQUEST');
+    expect(invalid.json().error.requestId).toBeTruthy();
+  });
 });

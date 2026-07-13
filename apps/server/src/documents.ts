@@ -6,13 +6,14 @@ import type { LoopDocument } from '@loop/contracts';
 import { resolveProjectPath } from './security.js';
 import type { LoopStore } from './store.js';
 
-const coreFiles = [
-  '总体方案.md',
-  '功能.md',
-  'UI.md',
-  'API接口.md',
-  '版本更迭.md'
-];
+export const coreDocuments = [
+  { filename: '总体方案.md', id: 'architecture' },
+  { filename: '功能.md', id: 'features' },
+  { filename: 'UI.md', id: 'ui' },
+  { filename: 'API接口.md', id: 'api' },
+  { filename: '版本更迭.md', id: 'roadmap' }
+] as const;
+export const coreFiles = coreDocuments.map((document) => document.filename);
 
 export function hashContent(content: string): string {
   return createHash('sha256').update(content.replace(/\r\n/g, '\n').trimEnd()).digest('hex');
@@ -30,6 +31,23 @@ function frontMatter(content: string): Record<string, string> {
 function titleFrom(content: string, filename: string): string {
   const heading = /^#\s+(.+)$/m.exec(content)?.[1];
   return heading?.trim() ?? basename(filename, '.md');
+}
+
+export function validateCoreDocuments(documents: LoopDocument[]): string[] {
+  const byFilename = new Map(documents.map((document) => [document.filename.replace(/\\/g, '/'), document]));
+  const errors: string[] = [];
+  for (const expected of coreDocuments) {
+    const document = byFilename.get(`docs/${expected.filename}`);
+    if (!document) {
+      errors.push(`缺少 docs/${expected.filename}`);
+      continue;
+    }
+    const metadata = frontMatter(document.content);
+    if (document.id !== expected.id || metadata.doc_id !== expected.id) errors.push(`${expected.filename} 的 doc_id 必须为 ${expected.id}`);
+    if (metadata.loop_schema !== '1') errors.push(`${expected.filename} 的 loop_schema 必须为 1`);
+    if (!/^\d+\.\d+\.\d+$/.test(metadata.version ?? '')) errors.push(`${expected.filename} 缺少有效的语义化 version`);
+  }
+  return errors;
 }
 
 export class DocumentService {
@@ -84,8 +102,13 @@ export class DocumentService {
       const id = metadata.doc_id ?? basename(filename, '.md').toLowerCase();
       const hash = hashContent(content);
       const prior = existing.get(id);
-      const status: LoopDocument['status'] = prior?.status === 'approved' && prior.hash !== hash ? 'stale' :
-        ((metadata.status as LoopDocument['status']) ?? prior?.status ?? 'draft');
+      // Front matter describes the document's authored status, but only an
+      // explicit API approval may establish the runtime approval gate.
+      const status: LoopDocument['status'] = !prior
+        ? 'draft'
+        : prior.status === 'approved' && prior.hash !== hash
+          ? 'stale'
+          : prior.status;
       const document: LoopDocument = {
         id,
         projectId,
@@ -104,7 +127,7 @@ export class DocumentService {
 
   async save(projectId: string, rootPath: string, docId: string, content: string): Promise<LoopDocument> {
     const existing = this.store.listDocuments(projectId).find((doc) => doc.id === docId);
-    if (!existing) throw new Error('Document not found');
+    if (!existing) throw new Error('DOCUMENT_NOT_FOUND');
     const filePath = await resolveProjectPath(rootPath, existing.filename, true);
     await mkdir(dirname(filePath), { recursive: true });
     const temp = `${filePath}.loop-tmp`;
@@ -115,7 +138,9 @@ export class DocumentService {
       ...existing,
       title: titleFrom(content, existing.filename),
       version: metadata.version ?? existing.version,
-      status: existing.hash === hashContent(content) ? existing.status : 'stale',
+      status: existing.hash === hashContent(content)
+        ? existing.status
+        : existing.status === 'draft' ? 'draft' : 'stale',
       hash: hashContent(content),
       content,
       updatedAt: new Date().toISOString()

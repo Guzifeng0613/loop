@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { setTimeout as delay } from 'node:timers/promises';
 import type {
   ProviderAdapter,
   ProviderConfig,
@@ -10,6 +11,36 @@ import type { CredentialStore } from './credentials.js';
 
 const OPENAI_MODELS = ['gpt-5.5', 'gpt-5.3-codex', 'gpt-5.4-mini'];
 const DEEPSEEK_MODELS = ['deepseek-v4-pro', 'deepseek-v4-flash'];
+
+function providerStatus(error: unknown): number | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const status = (error as Error & { status?: number }).status;
+  if (status) return status;
+  const match = /(?:API|status(?: code)?)\s+(\d{3})/i.exec(error.message);
+  return match?.[1] ? Number(match[1]) : undefined;
+}
+
+export async function completeWithRetry(
+  adapter: ProviderAdapter,
+  input: ProviderTurnInput,
+  signal?: AbortSignal,
+  maxAttempts = 4
+): Promise<ProviderTurnResult> {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await adapter.completeTurn(input, signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const status = providerStatus(error);
+      if (status === 401 || status === 403) throw new Error('PROVIDER_NOT_CONFIGURED: 模型凭据无效或已过期');
+      if (status !== 429) throw error;
+      if (attempt === maxAttempts - 1) throw new Error('PROVIDER_RATE_LIMITED: 模型供应商持续限流，请稍后继续');
+      const waitMs = Math.min(8_000, 400 * (2 ** attempt)) + Math.floor(Math.random() * 250);
+      await delay(waitMs, undefined, signal ? { signal } : undefined);
+    }
+  }
+  throw new Error('PROVIDER_RATE_LIMITED: 模型供应商持续限流，请稍后继续');
+}
 
 class OpenAIAdapter implements ProviderAdapter {
   readonly id = 'openai' as const;
@@ -58,7 +89,11 @@ class DeepSeekAdapter implements ProviderAdapter {
       body: JSON.stringify(body),
       ...(signal ? { signal } : {})
     });
-    if (!response.ok) throw new Error(`DeepSeek API ${response.status}: ${await response.text()}`);
+    if (!response.ok) {
+      const error = new Error(`DeepSeek API ${response.status}: ${await response.text()}`) as Error & { status?: number };
+      error.status = response.status;
+      throw error;
+    }
     return response.json();
   }
 
