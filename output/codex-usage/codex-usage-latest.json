@@ -1,0 +1,57 @@
+{
+  "fetchedAt": "2026-07-13T10:35:12.889Z",
+  "accounts": [
+    {
+      "name": "刘子琦",
+      "response": {
+        "code": 1,
+        "msg": "success",
+        "data": {
+          "generatedAt": "2026-07-13 18:35:08",
+          "enabled": false,
+          "disabledReason": "rule_disabled",
+          "subscription": {
+            "subscribeId": 1845293,
+            "subTypeId": 201,
+            "subTypeName": "codex 特惠 每日200刀月卡",
+            "dailyLimitUsd": 1000,
+            "per": "24h",
+            "billingType": "amount",
+            "expireTime": "2026-08-07 13:08:52",
+            "isLongTerm": false
+          },
+          "rule": null,
+          "window": null
+        }
+      },
+      "quota": null,
+      "error": "quota 返回异常"
+    },
+    {
+      "name": "顾天宇",
+      "response": {
+        "code": 1,
+        "msg": "success",
+        "data": {
+          "generatedAt": "2026-07-13 18:35:08",
+          "enabled": false,
+          "disabledReason": "rule_disabled",
+          "subscription": {
+            "subscribeId": 1845293,
+            "subTypeId": 201,
+            "subTypeName": "codex 特惠 每日200刀月卡",
+            "dailyLimitUsd": 1000,
+            "per": "24h",
+            "billingType": "amount",
+            "expireTime": "2026-08-07 13:08:52",
+            "isLongTerm": false
+          },
+          "rule": null,
+          "window": null
+        }
+      },
+      "quota": null,
+      "error": "quota: 解析 quota 响应失败 (HTTP 429): API calls quota exceeded! maximum admitted 1 per 1s."
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "name": "loop-agent-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run build -w @loop/contracts && concurrently -k -n server,web -c blue,magenta \"npm run dev -w @loop/server\" \"npm run dev -w @loop/web\"",
+    "build": "npm run build -w @loop/contracts && npm run build -w @loop/web && npm run build -w @loop/server",
+    "pretypecheck": "npm run build -w @loop/contracts",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "npm run start -w @loop/server"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.31.0",
+    "@types/node": "^24.0.15",
+    "concurrently": "^9.2.0",
+    "eslint": "^9.31.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

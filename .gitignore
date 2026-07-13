@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.vite/
+coverage/
+playwright-report/
+test-results/
+.loop/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+
