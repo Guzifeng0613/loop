@@ -5,11 +5,26 @@ import { basename, resolve } from 'node:path';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { z } from 'zod';
-import type { AppSettings, BootstrapPayload, ProviderId } from '@loop/contracts';
+import {
+  acceptanceRequestSchema,
+  createMessageRequestSchema,
+  createProjectRequestSchema,
+  createRunRequestSchema,
+  paginationQuerySchema,
+  resolveApprovalRequestSchema,
+  runActionRequestSchema,
+  saveDocumentRequestSchema,
+  settingsPatchSchema,
+  type AppSettings,
+  type BootstrapPayload,
+  type LoopDocument,
+  type ProviderId
+} from '@loop/contracts';
 import { config, dataDirectory, repoRoot } from './config.js';
 import { CredentialStore } from './credentials.js';
 import { DocumentService } from './documents.js';
 import { LoopError, normalizeError } from './errors.js';
+import { openApiDocument } from './openapi.js';
 import { Orchestrator } from './orchestrator.js';
 import { ProviderRegistry } from './providers.js';
 import { runProcess } from './security.js';
@@ -42,6 +57,37 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
+function pageCollection<T>(items: T[], rawQuery: unknown, defaultLimit = 100): { items: T[]; nextCursor?: string } {
+  const query = paginationQuerySchema.parse(rawQuery);
+  const limit = query.limit ?? defaultLimit;
+  let offset = 0;
+  if (query.cursor) {
+    try {
+      const decoded = JSON.parse(Buffer.from(query.cursor, 'base64url').toString('utf8')) as { offset?: unknown };
+      if (!Number.isInteger(decoded.offset) || Number(decoded.offset) < 0) throw new Error('invalid');
+      offset = Number(decoded.offset);
+    } catch {
+      throw new LoopError('INVALID_REQUEST', 'cursor 无效或已经过期。');
+    }
+  }
+  const page = items.slice(offset, offset + limit);
+  const nextOffset = offset + page.length;
+  return {
+    items: page,
+    ...(nextOffset < items.length
+      ? { nextCursor: Buffer.from(JSON.stringify({ offset: nextOffset })).toString('base64url') }
+      : {})
+  };
+}
+
+function documentMetadata(document: LoopDocument): LoopDocument {
+  return { ...document, content: '', contentLoaded: false };
+}
+
+function documentWithContent(document: LoopDocument): LoopDocument {
+  return { ...document, contentLoaded: true };
+}
+
 export interface AppContext {
   app: FastifyInstance;
   store: LoopStore;
@@ -49,6 +95,7 @@ export interface AppContext {
   orchestrator: Orchestrator;
   credentials: CredentialStore;
   providers: ProviderRegistry;
+  worktrees: WorktreeManager;
 }
 
 async function ensureSeed(context: AppContext): Promise<void> {
@@ -83,14 +130,60 @@ async function ensureSeed(context: AppContext): Promise<void> {
       ['decomposing', 'executing', 'integrating', 'verifying', 'optimizing'].includes(item.state)
     )) {
       context.store.releaseRunLeases(activeRun.id);
+      for (const reservation of context.store.listBudgetReservations(activeRun.id).filter((item) => item.status === 'reserved')) {
+        context.store.markBudgetReservationUnknown(reservation.id);
+      }
       for (const agent of context.store.listAgents(activeRun.id).filter((item) => item.status === 'running')) {
         context.store.upsertAgent({ ...agent, status: 'archived' });
       }
+      const message = '服务器重启后已从事件记录恢复，请确认后继续。';
       context.store.updateRun(activeRun.id, {
         state: 'paused',
         previousState: activeRun.state,
-        pauseReason: '服务器重启后已从事件记录恢复，请确认后继续。'
+        pauseReason: message,
+        blocker: {
+          kind: 'restart', code: 'SERVER_RESTARTED', message, since: new Date().toISOString(), recoverable: true,
+          details: {
+            actionAttemptIds: context.store.listRecoverableActionAttempts(activeRun.id).map((item) => item.id),
+            unknownBudgetReservationIds: context.store.listBudgetReservations(activeRun.id)
+              .filter((item) => item.status === 'unknown').map((item) => item.id)
+          }
+        }
       });
+    }
+    const projectRunIds = new Set(context.store.listRuns(project.id).map((item) => item.id));
+    for (const artifact of context.store.listWorktreeArtifacts().filter((item) => projectRunIds.has(item.runId) && !existsSync(item.path))) {
+      context.store.upsertWorktreeArtifact({ ...artifact, status: 'orphaned' });
+    }
+    for (const artifact of context.store.listExpiredWorktreeArtifacts().filter((item) => projectRunIds.has(item.runId))) {
+      try {
+        await context.worktrees.cleanupArtifact(project.rootPath, artifact.path, artifact.commitSha);
+        context.store.markWorktreeArtifactCleaned(artifact.id);
+      } catch (error) {
+        context.store.appendEvent(artifact.runId, 'error', {
+          code: 'WORKTREE_CLEANUP_FAILED',
+          message: error instanceof Error ? error.message : String(error),
+          artifactId: artifact.id
+        });
+      }
+    }
+    const knownBranches = new Set(context.store.listWorktreeArtifacts().filter((item) => projectRunIds.has(item.runId)).map((item) => item.branch));
+    const knownPaths = new Set(context.store.listWorktreeArtifacts().filter((item) => projectRunIds.has(item.runId)).map((item) => resolve(item.path).toLowerCase()));
+    for (const projectRun of context.store.listRuns(project.id)) {
+      const orphanPaths = (await context.worktrees.listRegisteredPaths(projectRun.id))
+        .filter((path) => !knownPaths.has(resolve(path).toLowerCase()));
+      if (orphanPaths.length > 0) {
+        context.store.appendEvent(projectRun.id, 'error', { code: 'ORPHAN_WORKTREE_DETECTED', paths: orphanPaths });
+      }
+    }
+    const orphanBranches = (await context.worktrees.listLoopBranches(project.rootPath)).filter((branch) => !knownBranches.has(branch));
+    const projectRuns = context.store.listRuns(project.id);
+    if (orphanBranches.length > 0 && projectRuns[0]) {
+      context.store.appendEvent(projectRuns[0].id, 'error', { code: 'ORPHAN_BRANCH_DETECTED', branches: orphanBranches });
+    }
+    const storage = await context.worktrees.storageUsage();
+    if (storage.ratio >= 0.8 && projectRuns[0]) {
+      context.store.appendEvent(projectRuns[0].id, 'error', { code: 'WORKTREE_QUOTA_WARNING', ...storage });
     }
   }
 
@@ -102,6 +195,7 @@ async function ensureSeed(context: AppContext): Promise<void> {
       title: 'Loop 工作台',
       question: '构建一个严格依赖 Markdown 文档、支持上下文换代的多 Agent 开发工作台。',
       modelMode: 'fixed',
+      executionMode: 'simple',
       providerId: 'local-demo',
       model: 'local-structured-demo'
     });
@@ -131,7 +225,7 @@ export async function createApp(databasePath = config.databasePath): Promise<App
   const documents = new DocumentService(store);
   const worktrees = new WorktreeManager(resolve(dataDirectory, 'worktrees'));
   const orchestrator = new Orchestrator(store, documents, providers, worktrees);
-  const context: AppContext = { app, store, documents, orchestrator, credentials, providers };
+  const context: AppContext = { app, store, documents, orchestrator, credentials, providers, worktrees };
   const inFlightIdempotency = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
 
   async function idempotent<T>(request: FastifyRequest, scope: string, operation: () => Promise<T> | T): Promise<T> {
@@ -170,6 +264,62 @@ export async function createApp(databasePath = config.databasePath): Promise<App
     }
   }
 
+  async function resolveRunApproval(
+    runId: string,
+    approvalId: string,
+    decision: 'approved' | 'rejected',
+    scope: 'once' | 'rule'
+  ): Promise<{ ok: true; approval: ReturnType<LoopStore['resolveApproval']> }> {
+    const before = store.getApproval(approvalId);
+    if (!before || before.runId !== runId) throw new Error('APPROVAL_NOT_FOUND');
+    const blockedRun = store.getRun(runId);
+    const approval = store.resolveApproval(approvalId, decision, scope);
+    if (decision === 'rejected') {
+      if (approval.actionAttemptId) {
+        const attempt = store.getActionAttempt(approval.actionAttemptId);
+        if (attempt && !['completed', 'failed', 'cancelled'].includes(attempt.status)) store.failActionAttempt(attempt.id, 'APPROVAL_REJECTED');
+        if (attempt?.taskId) {
+          const task = store.listTasks(runId).find((item) => item.id === attempt.taskId);
+          if (task) store.upsertTask({ ...task, status: 'blocked' });
+        }
+      }
+      const run = store.getRun(runId);
+      if (run) {
+        const message = `审批 ${approvalId} 已拒绝`;
+        orchestrator.interrupt(runId);
+        store.updateRun(runId, {
+          state: 'paused', previousState: run.state === 'paused' ? (run.previousState ?? 'executing') : run.state, pauseReason: message,
+          blocker: { kind: 'user_pause', code: 'APPROVAL_REJECTED', message, since: new Date().toISOString(), recoverable: true }
+        });
+      }
+      return { ok: true, approval };
+    }
+
+    const run = store.getRun(runId);
+    const nextPending = store.listApprovals(runId).find((item) => item.status === 'pending');
+    if (approval.tool === 'merge_integration' && blockedRun?.state === 'paused' && blockedRun.blocker?.kind === 'approval' && !nextPending) {
+      store.updateRun(runId, { state: 'awaiting_acceptance', previousState: 'paused', blocker: null, pauseReason: null });
+      await orchestrator.acceptDelivery(runId, 'accept_merge');
+      return { ok: true, approval };
+    }
+    if (blockedRun?.state === 'paused' && blockedRun.blocker?.kind === 'approval' && !nextPending) {
+      const target = blockedRun.previousState && !['paused', 'failed', 'cancelled', 'completed'].includes(blockedRun.previousState)
+        ? blockedRun.previousState
+        : 'executing';
+      const resumed = store.updateRun(runId, { state: target, previousState: 'paused', blocker: null, pauseReason: null });
+      if (['decomposing', 'executing'].includes(resumed.state)) await orchestrator.execute(runId);
+      if (['integrating', 'verifying'].includes(resumed.state)) await orchestrator.integrate(runId);
+    } else if ((blockedRun?.blocker?.kind === 'approval' || run?.blocker?.kind === 'approval') && nextPending) {
+      store.updateRun(runId, {
+        blocker: {
+          kind: 'approval', code: 'APPROVAL_REQUIRED', message: nextPending.policyReason,
+          since: nextPending.createdAt, recoverable: true, approvalId: nextPending.id
+        }
+      });
+    }
+    return { ok: true, approval };
+  }
+
   app.addHook('onRequest', async (request, reply) => {
     if (!['localhost', '127.0.0.1', '::1'].includes(request.hostname)) {
       return reply.status(403).send({ error: { code: 'ORIGIN_DENIED', message: 'Host 未获 localhost 授权。', requestId: request.id } });
@@ -196,32 +346,59 @@ export async function createApp(databasePath = config.databasePath): Promise<App
   app.get('/api/bootstrap', async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
     const query = z.object({ runId: z.string().optional(), projectId: z.string().optional() }).parse(request.query);
-    const projects = store.listProjects();
-    const currentProject = projects.find((item) => item.id === query.projectId) ?? projects[0];
-    const runs = store.listRuns(currentProject?.id);
-    const currentRun = runs.find((item) => item.id === query.runId) ?? runs[0];
+    const allProjects = store.listProjects();
+    const currentProject = allProjects.find((item) => item.id === query.projectId) ?? allProjects[0];
+    const projects = currentProject
+      ? [currentProject, ...allProjects.filter((item) => item.id !== currentProject.id)].slice(0, 100)
+      : [];
+    const allRuns = store.listRuns(currentProject?.id);
+    const currentRun = allRuns.find((item) => item.id === query.runId) ?? allRuns[0];
+    const runs = currentRun
+      ? [currentRun, ...allRuns.filter((item) => item.id !== currentRun.id)].slice(0, 100)
+      : [];
+    const snapshot = currentRun ? store.readSnapshot(currentRun.id, () => ({
+      messages: store.listMessages(currentRun.id).slice(-100),
+      tasks: store.listTasks(currentRun.id).slice(0, 200),
+      agents: store.listAgents(currentRun.id).slice(0, 200),
+      approvals: store.listApprovals(currentRun.id).slice(0, 100),
+      events: store.listRecentEvents(currentRun.id, 200),
+      usage: {
+        ...store.getUsage(currentRun.id),
+        elapsedMinutes: Math.max(0, (Date.now() - new Date(currentRun.createdAt).getTime()) / 60_000)
+      }
+    })) : undefined;
     const payload: BootstrapPayload = {
+      schemaVersion: 2,
       sessionToken: config.sessionToken,
       projects,
       runs,
-      ...(currentProject ? { currentProject, documents: store.listDocuments(currentProject.id) } : { documents: [] }),
+      ...(currentProject ? { currentProject, documents: store.listDocuments(currentProject.id).map(documentMetadata) } : { documents: [] }),
       ...(currentRun ? {
         currentRun,
-        messages: store.listMessages(currentRun.id),
-        tasks: store.listTasks(currentRun.id),
-        agents: store.listAgents(currentRun.id),
-        approvals: store.listApprovals(currentRun.id)
-      } : { messages: [], tasks: [], agents: [], approvals: [] }),
+        messages: snapshot!.data.messages,
+        tasks: snapshot!.data.tasks,
+        agents: snapshot!.data.agents,
+        approvals: snapshot!.data.approvals,
+        events: snapshot!.data.events,
+        usage: snapshot!.data.usage,
+        snapshotVersion: snapshot!.snapshotVersion,
+        eventWatermark: snapshot!.eventWatermark
+      } : {
+        messages: [], tasks: [], agents: [], approvals: [], events: [],
+        usage: { calls: 0, inputTokens: 0, outputTokens: 0, estimatedCost: 0, elapsedMinutes: 0 },
+        snapshotVersion: 0,
+        eventWatermark: 0
+      }),
       providers: await providers.configs(),
       settings: store.getSetting<AppSettings>('app')!
     };
     return payload;
   });
 
-  app.get('/api/projects', async () => store.listProjects());
+  app.get('/api/projects', async (request) => pageCollection(store.listProjects(), request.query));
   app.post('/api/projects', async (request) => {
     return idempotent(request, 'projects:create', async () => {
-      const body = z.object({ rootPath: z.string().min(1), name: z.string().optional() }).parse(request.body);
+      const body = createProjectRequestSchema.parse(request.body);
       let rootPath: string;
       try {
         rootPath = await realpath(body.rootPath);
@@ -254,20 +431,23 @@ export async function createApp(databasePath = config.databasePath): Promise<App
   });
 
   app.get('/api/runs', async (request) => {
-    const query = z.object({ projectId: z.string().optional() }).parse(request.query);
-    return store.listRuns(query.projectId);
+    const query = z.object({ projectId: z.string().optional(), cursor: z.string().optional(), limit: z.coerce.number().optional() }).parse(request.query);
+    return pageCollection(store.listRuns(query.projectId), {
+      ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
+      ...(query.limit === undefined ? {} : { limit: query.limit })
+    });
   });
 
   app.post('/api/runs', async (request) => {
     return idempotent(request, 'runs:create', async () => {
-      const body = z.object({
-        projectId: z.string(), title: z.string().min(1), question: z.string().min(1),
-        modelMode: z.enum(['fixed', 'auto']).default('fixed'),
-        providerId: z.enum(['openai', 'deepseek', 'local-demo']).default('local-demo'),
-        model: z.string().min(1).default('local-structured-demo')
-      }).parse(request.body);
-      if (!store.getProject(body.projectId)) throw new Error('PROJECT_NOT_FOUND');
-      const run = store.createRun(body);
+      const body = createRunRequestSchema.parse(request.body);
+      const project = store.getProject(body.projectId);
+      if (!project) throw new Error('PROJECT_NOT_FOUND');
+      const run = store.createRun({
+        ...body,
+        baseRef: project.isGit ? await worktrees.head(project.rootPath) : 'HEAD',
+        allowedProviderIds: body.modelMode === 'fixed' ? [body.providerId] : (body.allowedProviderIds ?? [body.providerId])
+      });
       await orchestrator.sendMessage(run.id, body.question);
       return store.getRun(run.id)!;
     });
@@ -281,13 +461,17 @@ export async function createApp(databasePath = config.databasePath): Promise<App
   app.patch('/api/runs/:id', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     return idempotent(request, `runs:${id}:action`, async () => {
-      const body = z.object({ action: z.enum(['pause', 'resume', 'cancel', 'retry']) }).parse(request.body);
+      const body = runActionRequestSchema.parse(request.body);
       const run = store.getRun(id);
       if (!run) throw new Error('RUN_NOT_FOUND');
       if (body.action === 'pause') {
         if (['paused', 'completed', 'cancelled', 'failed'].includes(run.state)) throw new Error(`RUN_STATE_CONFLICT: ${run.state} 状态不能暂停`);
         orchestrator.interrupt(id);
-        return store.updateRun(id, { state: 'paused', previousState: run.state, pauseReason: '用户暂停' });
+        const message = '用户暂停';
+        return store.updateRun(id, {
+          state: 'paused', previousState: run.state, pauseReason: message,
+          blocker: { kind: 'user_pause', code: 'USER_PAUSED', message, since: new Date().toISOString(), recoverable: true }
+        });
       }
       if (body.action === 'cancel') {
         if (['completed', 'cancelled'].includes(run.state)) throw new Error(`RUN_STATE_CONFLICT: ${run.state} 状态不能取消`);
@@ -296,10 +480,30 @@ export async function createApp(databasePath = config.databasePath): Promise<App
       }
       const expectedState = body.action === 'resume' ? 'paused' : 'failed';
       if (run.state !== expectedState) throw new Error(`RUN_STATE_CONFLICT: 只有 ${expectedState} 运行可以${body.action === 'resume' ? '继续' : '重试'}`);
+      const pendingApproval = store.listApprovals(id).find((approval) => approval.status === 'pending');
+      if (pendingApproval) throw new Error(`APPROVAL_REQUIRED: 审批 ${pendingApproval.id} 尚未处理`);
+      if (run.blocker?.kind === 'approval') {
+        const approval = run.blocker.approvalId ? store.getApproval(run.blocker.approvalId) : undefined;
+        if (!approval || approval.status !== 'approved') throw new Error('APPROVAL_REQUIRED: 待审批操作尚未批准');
+      }
+      if (run.blocker?.kind === 'documents') throw new Error('DOCS_NOT_APPROVED: 文档变更后必须重新批准规范');
+      if (run.blocker?.code === 'ACTION_OUTCOME_UNKNOWN') {
+        throw new Error('RUN_STATE_CONFLICT: 中断动作结果未知，不能自动重放；请检查 worktree 后重试任务');
+      }
+      if (run.blocker?.kind === 'restart') {
+        for (const reservation of store.listBudgetReservations(id).filter((item) => item.status === 'unknown')) {
+          store.settleBudgetReservation(reservation.id, {
+            calls: reservation.reservedCalls,
+            inputTokens: reservation.reservedInputTokens,
+            outputTokens: reservation.reservedOutputTokens,
+            actualCost: reservation.reservedCost
+          });
+        }
+      }
       const target = run.previousState && !['paused', 'failed', 'cancelled', 'completed'].includes(run.previousState)
         ? run.previousState
         : 'clarifying';
-      const resumed = store.updateRun(id, { state: target, previousState: run.state, pauseReason: null });
+      const resumed = store.updateRun(id, { state: target, previousState: run.state, blocker: null, pauseReason: null });
       if (['decomposing', 'executing'].includes(resumed.state)) await orchestrator.execute(id);
       if (['integrating', 'verifying', 'optimizing'].includes(resumed.state)) await orchestrator.integrate(id);
       return resumed;
@@ -308,12 +512,12 @@ export async function createApp(databasePath = config.databasePath): Promise<App
 
   app.get('/api/runs/:id/messages', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
-    return store.listMessages(id);
+    return pageCollection(store.listMessages(id), request.query);
   });
 
   app.post('/api/runs/:id/messages', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
-    const body = z.object({ content: z.string().min(1).max(100_000) }).parse(request.body);
+    const body = createMessageRequestSchema.parse(request.body);
     return idempotent(request, `runs:${id}:messages:create`, () => orchestrator.sendMessage(id, body.content));
   });
 
@@ -321,37 +525,47 @@ export async function createApp(databasePath = config.databasePath): Promise<App
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const run = store.getRun(id);
     if (!run) throw new Error('RUN_NOT_FOUND');
-    return store.listDocuments(run.projectId);
+    return pageCollection(store.listDocuments(run.projectId).map(documentMetadata), request.query, 20);
+  });
+
+  app.get('/api/runs/:id/docs/:docId', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const { id, docId } = z.object({ id: z.string(), docId: z.string() }).parse(request.params);
+    const run = store.getRun(id);
+    if (!run) throw new Error('RUN_NOT_FOUND');
+    const document = store.getDocument(run.projectId, docId);
+    if (!document) throw new Error('DOCUMENT_NOT_FOUND');
+    return documentWithContent(document);
   });
 
   app.patch('/api/runs/:id/docs/:docId', async (request) => {
     const { id, docId } = z.object({ id: z.string(), docId: z.string() }).parse(request.params);
-    const body = z.object({ content: z.string().min(1).max(1_500_000) }).parse(request.body);
+    const body = saveDocumentRequestSchema.parse(request.body);
     return idempotent(request, `runs:${id}:docs:${docId}:save`, async () => {
       const run = store.getRun(id);
       if (!run) throw new Error('RUN_NOT_FOUND');
       const project = store.getProject(run.projectId);
       if (!project) throw new Error('PROJECT_NOT_FOUND');
       const before = store.getDocument(project.id, docId);
-      const document = await documents.save(project.id, project.rootPath, docId, body.content);
+      const document = await documents.save(project.id, project.rootPath, docId, body.content, body.expectedHash);
       if (before?.hash !== document.hash) await orchestrator.invalidateForDocumentChange(id, docId);
-      return document;
+      return documentWithContent(document);
     });
   });
 
   // Documented collection PATCH; the per-document route above remains for the existing frontend.
   app.patch('/api/runs/:id/docs', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
-    const body = z.object({ docId: z.string(), content: z.string().min(1).max(1_500_000) }).parse(request.body);
+    const body = saveDocumentRequestSchema.extend({ docId: z.string().min(1) }).parse(request.body);
     return idempotent(request, `runs:${id}:docs:${body.docId}:save`, async () => {
       const run = store.getRun(id);
       if (!run) throw new Error('RUN_NOT_FOUND');
       const project = store.getProject(run.projectId);
       if (!project) throw new Error('PROJECT_NOT_FOUND');
       const before = store.getDocument(project.id, body.docId);
-      const document = await documents.save(project.id, project.rootPath, body.docId, body.content);
+      const document = await documents.save(project.id, project.rootPath, body.docId, body.content, body.expectedHash);
       if (before?.hash !== document.hash) await orchestrator.invalidateForDocumentChange(id, body.docId);
-      return document;
+      return documentWithContent(document);
     });
   });
 
@@ -380,72 +594,42 @@ export async function createApp(databasePath = config.databasePath): Promise<App
   app.get('/api/runs/:id/tasks', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     if (!store.getRun(id)) throw new Error('RUN_NOT_FOUND');
-    return store.listTasks(id);
+    return pageCollection(store.listTasks(id), request.query);
   });
   app.get('/api/runs/:id/agents', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     if (!store.getRun(id)) throw new Error('RUN_NOT_FOUND');
-    return store.listAgents(id);
+    return pageCollection(store.listAgents(id), request.query);
   });
   app.get('/api/runs/:id/checkpoints', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     if (!store.getRun(id)) throw new Error('RUN_NOT_FOUND');
-    return store.listCheckpoints(id);
+    return pageCollection(store.listCheckpoints(id), request.query);
   });
   app.get('/api/runs/:id/approvals', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     if (!store.getRun(id)) throw new Error('RUN_NOT_FOUND');
-    return store.listApprovals(id);
+    return pageCollection(store.listApprovals(id), request.query);
   });
 
   app.post('/api/runs/:id/approvals/:approvalId', async (request) => {
     const { id, approvalId } = z.object({ id: z.string(), approvalId: z.string() }).parse(request.params);
-    const body = z.object({ decision: z.enum(['approved', 'rejected']) }).parse(request.body);
+    const body = resolveApprovalRequestSchema.parse(request.body);
     return idempotent(request, `runs:${id}:approvals:${approvalId}:resolve`, async () => {
-      const approval = store.listApprovals(id).find((item) => item.id === approvalId);
-      if (!approval) throw new Error('APPROVAL_NOT_FOUND');
-      if (approval.status !== 'pending' && approval.status !== body.decision) {
-        throw new Error('RUN_STATE_CONFLICT: 审批已经按另一结果处理');
-      }
-      const wasPending = approval.status === 'pending';
-      if (approval.status === 'pending') store.resolveApproval(approvalId, body.decision);
-      if (wasPending && approval.tool === 'merge_integration' && body.decision === 'approved') await orchestrator.integrate(id);
-      if (body.decision === 'rejected') {
-        const run = store.getRun(id);
-        if (run && run.state !== 'paused') {
-          orchestrator.interrupt(id);
-          store.updateRun(id, { state: 'paused', previousState: run.state, pauseReason: `审批 ${approvalId} 已拒绝` });
-        }
-      }
-      return { ok: true };
+      return resolveRunApproval(id, approvalId, body.decision, body.scope);
     });
   });
 
   // Documented collection POST; the resource route above remains frontend-compatible.
   app.post('/api/runs/:id/approvals', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
-    const body = z.object({ approvalId: z.string(), decision: z.enum(['approved', 'rejected']) }).parse(request.body);
+    const body = resolveApprovalRequestSchema.extend({ approvalId: z.string().min(1) }).parse(request.body);
     return idempotent(request, `runs:${id}:approvals:${body.approvalId}:resolve`, async () => {
-      const approval = store.listApprovals(id).find((item) => item.id === body.approvalId);
-      if (!approval) throw new Error('APPROVAL_NOT_FOUND');
-      if (approval.status !== 'pending' && approval.status !== body.decision) {
-        throw new Error('RUN_STATE_CONFLICT: 审批已经按另一结果处理');
-      }
-      const wasPending = approval.status === 'pending';
-      if (approval.status === 'pending') store.resolveApproval(body.approvalId, body.decision);
-      if (wasPending && approval.tool === 'merge_integration' && body.decision === 'approved') await orchestrator.integrate(id);
-      if (body.decision === 'rejected') {
-        const run = store.getRun(id);
-        if (run && run.state !== 'paused') {
-          orchestrator.interrupt(id);
-          store.updateRun(id, { state: 'paused', previousState: run.state, pauseReason: `审批 ${body.approvalId} 已拒绝` });
-        }
-      }
-      return { ok: true };
+      return resolveRunApproval(id, body.approvalId, body.decision, body.scope);
     });
   });
 
-  app.get('/api/providers', async () => providers.configs());
+  app.get('/api/providers', async (request) => pageCollection(await providers.configs(), request.query, 20));
   app.patch('/api/providers/:providerId', async (request) => {
     const { providerId } = z.object({ providerId: z.enum(['openai', 'deepseek']) }).parse(request.params);
     const body = z.object({ apiKey: z.string().min(8).optional(), clear: z.boolean().optional() }).parse(request.body);
@@ -472,20 +656,7 @@ export async function createApp(databasePath = config.databasePath): Promise<App
   app.get('/api/settings', async () => store.getSetting<AppSettings>('app'));
   app.patch('/api/settings', async (request) => {
     const current = store.getSetting<AppSettings>('app')!;
-    const body = z.object({
-      concurrency: z.number().int().min(1).max(16).optional(),
-      maxDepth: z.number().int().min(1).max(4).optional(),
-      maxAgents: z.number().int().min(1).max(200).optional(),
-      mainDirectLimit: z.number().int().min(1).max(30).optional(),
-      autoMode: z.boolean().optional(),
-      budget: z.object({
-        maxCalls: z.number().int().positive().optional(),
-        maxInputTokens: z.number().int().positive().optional(),
-        maxOutputTokens: z.number().int().positive().optional(),
-        maxMinutes: z.number().positive().optional(),
-        maxEstimatedCost: z.number().nonnegative().optional()
-      }).optional()
-    }).parse(request.body);
+    const body = settingsPatchSchema.parse(request.body);
     return idempotent(request, 'settings:update', () => {
       const { budget: budgetPatch, ...settingsPatch } = body;
       const budget: AppSettings['budget'] = { ...current.budget };
@@ -514,6 +685,14 @@ export async function createApp(databasePath = config.databasePath): Promise<App
     if (!project) throw new Error('PROJECT_NOT_FOUND');
     const messages = store.listMessages(id);
     const tasks = store.listTasks(id);
+    const generations = store.listPlanGenerations(id);
+    const attempts = store.listActionAttempts(id, undefined, 'all');
+    const checkpoints = store.listCheckpoints(id);
+    const taskResults = store.listTaskResults(id, 'all');
+    const delivery = store.getDeliverySummary(id);
+    const toolOutputs = store.listToolOutputs(id, undefined, 'all');
+    const artifacts = store.listWorktreeArtifacts(id);
+    const reservations = store.listBudgetReservations(id);
     const events: ReturnType<LoopStore['listEvents']> = [];
     let eventCursor = 0;
     while (true) {
@@ -545,6 +724,52 @@ export async function createApp(databasePath = config.databasePath): Promise<App
       '',
       ...tasks.map((task) => `- [${task.status === 'completed' ? 'x' : ' '}] ${task.id} ${task.title}（${task.status}）`),
       '',
+      '## 计划代次',
+      '',
+      ...generations.map((generation) => `- generation ${generation.generation} · ${generation.status} · ${generation.reason ?? '初始规范'} · ${generation.createdAt}`),
+      '',
+      '## 动作尝试',
+      '',
+      ...attempts.map((attempt) => {
+        const serialized = JSON.stringify(attempt.action);
+        const action = serialized.length > 2_000 ? `${serialized.slice(0, 2_000)}…（已截断）` : serialized;
+        return `- ${attempt.id} · generation ${attempt.generation} · #${attempt.sequence} · ${attempt.status} · key=${attempt.idempotencyKey} · action=${action}${attempt.toolOutputId ? ` · output=${attempt.toolOutputId}` : ''}${attempt.error ? ` · error=${attempt.error}` : ''}`;
+      }),
+      '',
+      '## 检点',
+      '',
+      ...checkpoints.map((checkpoint) => `- ${checkpoint.id} · agent ${checkpoint.agentId} · lineage ${checkpoint.lineage} · watermark ${checkpoint.eventWatermark} · next=${checkpoint.nextAction}`),
+      '',
+      '## 结构化任务结果',
+      '',
+      ...taskResults.map((result) => `- ${result.taskId} · generation ${result.generation} · verified=${result.verified} · commit=${result.commitSha ?? 'none'} · ${result.summary}`),
+      '',
+      '## 交付摘要',
+      '',
+      ...(delivery ? [
+        `- generation: ${delivery.generation}`,
+        `- base: ${delivery.baseRef}`,
+        `- integration branch: ${delivery.integrationBranch ?? 'none'}`,
+        `- files: ${delivery.filesChanged.join(', ') || 'none'}`,
+        `- commits: ${delivery.commits.join(', ') || 'none'}`,
+        `- verification: ${delivery.verificationCommands.join(', ') || 'none'}`,
+        `- risks: ${delivery.risks.join('；') || 'none'}`,
+        `- unresolved: ${delivery.unresolved.join('；') || 'none'}`,
+        `- actual cost: ${delivery.actualCost}`
+      ] : ['- 尚未生成']),
+      '',
+      '## 工具输出索引',
+      '',
+      ...toolOutputs.map((output) => `- ${output.id} · ${output.tool} · ${output.byteLength} bytes · truncated=${output.truncated} · ${output.createdAt}`),
+      '',
+      '## Worktree artifacts',
+      '',
+      ...artifacts.map((artifact) => `- ${artifact.id} · generation ${artifact.generation} · ${artifact.kind}/${artifact.status} · ${artifact.branch} · ${artifact.commitSha ?? 'no commit'} · ${artifact.path}`),
+      '',
+      '## 预算预留',
+      '',
+      ...reservations.map((reservation) => `- ${reservation.id} · ${reservation.providerId}/${reservation.model ?? 'default'} · ${reservation.status} · reserved ${reservation.reservedInputTokens}+${reservation.reservedOutputTokens} tokens · cost ${reservation.actualCost ?? reservation.reservedCost}`),
+      '',
       '## 事件摘要',
       '',
       ...events.map((event) => `- ${event.id} · ${event.createdAt} · ${event.type}`),
@@ -553,9 +778,34 @@ export async function createApp(databasePath = config.databasePath): Promise<App
     return { filename: `loop-run-${run.id}.md`, content };
   });
 
+  app.get('/api/openapi.json', async () => openApiDocument);
+
+  app.get('/api/runs/:id/delivery', async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    if (!store.getRun(id)) throw new Error('RUN_NOT_FOUND');
+    const delivery = store.getDeliverySummary(id);
+    if (!delivery) throw new Error('DELIVERY_NOT_FOUND');
+    return delivery;
+  });
+
+  app.post('/api/runs/:id/acceptance', async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const body = acceptanceRequestSchema.parse(request.body);
+    return idempotent(request, `runs:${id}:acceptance`, () => orchestrator.acceptDelivery(id, body.decision, body.feedback));
+  });
+
+  app.get('/api/runs/:id/tool-outputs/:outputId', async (request) => {
+    const { id, outputId } = z.object({ id: z.string(), outputId: z.string() }).parse(request.params);
+    if (!store.getRun(id)) throw new Error('RUN_NOT_FOUND');
+    const output = store.getToolOutput(outputId);
+    if (!output || output.runId !== id) throw new Error('TOOL_OUTPUT_NOT_FOUND');
+    return output;
+  });
+
   app.get('/api/runs/:id/events', async (request, reply) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     if (!store.getRun(id)) throw new Error('RUN_NOT_FOUND');
+    const query = z.object({ after: z.coerce.number().int().nonnegative().optional() }).parse(request.query);
     const header = z.coerce.number().int().nonnegative().parse(request.headers['last-event-id'] ?? 0);
     reply.hijack();
     reply.raw.writeHead(200, {
@@ -564,8 +814,10 @@ export async function createApp(databasePath = config.databasePath): Promise<App
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no'
     });
+    reply.raw.write('retry: 2000\n\n');
     const writeEvent = (event: unknown & { id?: number; type?: string }) => {
-      reply.raw.write(`id: ${event.id ?? ''}\nevent: ${event.type ?? 'message'}\ndata: ${JSON.stringify(event)}\n\n`);
+      const transportType = event.type === 'error' ? 'loop.error' : (event.type ?? 'message');
+      reply.raw.write(`id: ${event.id ?? ''}\nevent: ${transportType}\ndata: ${JSON.stringify(event)}\n\n`);
     };
     let replaying = true;
     const buffered: { id?: number; type?: string }[] = [];
@@ -576,7 +828,7 @@ export async function createApp(databasePath = config.databasePath): Promise<App
     };
     store.events.on(`run:${id}`, listener);
     const watermark = store.getEventWatermark(id);
-    let cursor = header;
+    let cursor = Math.max(header, query.after ?? 0);
     while (cursor < watermark) {
       const page = store.listEvents(id, cursor, 1000, watermark);
       if (page.length === 0) break;
@@ -587,7 +839,13 @@ export async function createApp(databasePath = config.databasePath): Promise<App
     for (const event of buffered.filter((item) => (item.id ?? 0) > watermark).sort((left, right) => (left.id ?? 0) - (right.id ?? 0))) {
       writeEvent(event);
     }
-    const heartbeat = setInterval(() => reply.raw.write(': heartbeat\n\n'), 15_000);
+    const writeHeartbeat = () => reply.raw.write(`event: loop.heartbeat\ndata: ${JSON.stringify({
+      eventWatermark: store.getEventWatermark(id),
+      snapshotVersion: store.getSnapshotVersion(id),
+      reconnectAfterMs: 2_000
+    })}\n\n`);
+    writeHeartbeat();
+    const heartbeat = setInterval(writeHeartbeat, 15_000);
     request.raw.on('close', () => {
       clearInterval(heartbeat);
       store.events.off(`run:${id}`, listener);

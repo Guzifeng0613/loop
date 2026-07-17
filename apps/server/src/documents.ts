@@ -1,8 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { watch, type FSWatcher } from 'node:fs';
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, resolve } from 'node:path';
 import type { LoopDocument } from '@loop/contracts';
+import { LoopError } from './errors.js';
 import { resolveProjectPath } from './security.js';
 import type { LoopStore } from './store.js';
 
@@ -45,7 +46,7 @@ export function validateCoreDocuments(documents: LoopDocument[]): string[] {
     const metadata = frontMatter(document.content);
     if (document.id !== expected.id || metadata.doc_id !== expected.id) errors.push(`${expected.filename} 的 doc_id 必须为 ${expected.id}`);
     if (metadata.loop_schema !== '1') errors.push(`${expected.filename} 的 loop_schema 必须为 1`);
-    if (!/^\d+\.\d+\.\d+$/.test(metadata.version ?? '')) errors.push(`${expected.filename} 缺少有效的语义化 version`);
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(metadata.version ?? '')) errors.push(`${expected.filename} 缺少有效的语义化 version`);
   }
   return errors;
 }
@@ -53,6 +54,7 @@ export function validateCoreDocuments(documents: LoopDocument[]): string[] {
 export class DocumentService {
   private readonly watchers = new Map<string, FSWatcher>();
   private readonly debounceTimers = new Map<string, NodeJS.Timeout>();
+  private readonly documentLocks = new Map<string, Promise<void>>();
 
   constructor(private readonly store: LoopStore) {}
 
@@ -81,6 +83,58 @@ export class DocumentService {
     this.watchers.clear();
   }
 
+  private async withDocumentLock<T>(path: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.documentLocks.get(path) ?? Promise.resolve();
+    let release = (): void => {};
+    const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+    const queued = previous.catch(() => undefined).then(() => gate);
+    this.documentLocks.set(path, queued);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.documentLocks.get(path) === queued) this.documentLocks.delete(path);
+    }
+  }
+
+  private documentFromContent(existing: LoopDocument, content: string): LoopDocument {
+    const hash = hashContent(content);
+    const metadata = frontMatter(content);
+    return {
+      ...existing,
+      title: titleFrom(content, existing.filename),
+      version: metadata.version ?? existing.version,
+      status: existing.hash === hash
+        ? existing.status
+        : existing.status === 'approved' ? 'stale' : existing.status,
+      hash,
+      content,
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  private documentMetadata(document: LoopDocument): Omit<LoopDocument, 'content'> {
+    return {
+      id: document.id,
+      projectId: document.projectId,
+      filename: document.filename,
+      title: document.title,
+      version: document.version,
+      status: document.status,
+      hash: document.hash,
+      updatedAt: document.updatedAt
+    };
+  }
+
+  private staleDocumentError(document: LoopDocument): LoopError {
+    return new LoopError(
+      'DOC_VERSION_STALE',
+      '文档已在磁盘上变化；当前保存未覆盖任何内容，请重新同步后再提交。',
+      { latest: this.documentMetadata(document) }
+    );
+  }
+
   async syncProject(projectId: string, rootPath: string): Promise<LoopDocument[]> {
     const docsRoot = resolve(rootPath, 'docs');
     try {
@@ -89,63 +143,79 @@ export class DocumentService {
       await mkdir(docsRoot, { recursive: true });
     }
 
-    const existing = new Map(this.store.listDocuments(projectId).map((doc) => [doc.id, doc]));
     for (const filename of coreFiles) {
       const filePath = resolve(docsRoot, filename);
-      let content: string;
-      try {
-        content = await readFile(filePath, 'utf8');
-      } catch {
-        continue;
-      }
-      const metadata = frontMatter(content);
-      const id = metadata.doc_id ?? basename(filename, '.md').toLowerCase();
-      const hash = hashContent(content);
-      const prior = existing.get(id);
-      // Front matter describes the document's authored status, but only an
-      // explicit API approval may establish the runtime approval gate.
-      const status: LoopDocument['status'] = !prior
-        ? 'draft'
-        : prior.status === 'approved' && prior.hash !== hash
-          ? 'stale'
-          : prior.status;
-      const document: LoopDocument = {
-        id,
-        projectId,
-        filename: `docs/${filename}`,
-        title: titleFrom(content, filename),
-        version: metadata.version ?? prior?.version ?? '0.1.0',
-        status,
-        hash,
-        content,
-        updatedAt: new Date().toISOString()
-      };
-      this.store.upsertDocument(document, prior?.status === 'approved' && prior.hash === hash ? hash : undefined);
+      await this.withDocumentLock(filePath, async () => {
+        let content: string;
+        try {
+          content = await readFile(filePath, 'utf8');
+        } catch {
+          return;
+        }
+        const metadata = frontMatter(content);
+        const id = metadata.doc_id ?? basename(filename, '.md').toLowerCase();
+        const hash = hashContent(content);
+        const prior = this.store.getDocument(projectId, id);
+        // Front matter describes the document's authored status, but only an
+        // explicit API approval may establish the runtime approval gate.
+        const status: LoopDocument['status'] = !prior
+          ? 'draft'
+          : prior.status === 'approved' && prior.hash !== hash
+            ? 'stale'
+            : prior.status;
+        const document: LoopDocument = {
+          id,
+          projectId,
+          filename: `docs/${filename}`,
+          title: titleFrom(content, filename),
+          version: metadata.version ?? prior?.version ?? '0.2.0-alpha.1',
+          status,
+          hash,
+          content,
+          updatedAt: new Date().toISOString()
+        };
+        this.store.upsertDocument(document, prior?.status === 'approved' && prior.hash === hash ? hash : undefined);
+      });
     }
     return this.store.listDocuments(projectId);
   }
 
-  async save(projectId: string, rootPath: string, docId: string, content: string): Promise<LoopDocument> {
+  async save(
+    projectId: string,
+    rootPath: string,
+    docId: string,
+    content: string,
+    expectedHash: string
+  ): Promise<LoopDocument> {
     const existing = this.store.listDocuments(projectId).find((doc) => doc.id === docId);
     if (!existing) throw new Error('DOCUMENT_NOT_FOUND');
     const filePath = await resolveProjectPath(rootPath, existing.filename, true);
-    await mkdir(dirname(filePath), { recursive: true });
-    const temp = `${filePath}.loop-tmp`;
-    await writeFile(temp, content, 'utf8');
-    await rename(temp, filePath);
-    const metadata = frontMatter(content);
-    const next: LoopDocument = {
-      ...existing,
-      title: titleFrom(content, existing.filename),
-      version: metadata.version ?? existing.version,
-      status: existing.hash === hashContent(content)
-        ? existing.status
-        : existing.status === 'draft' ? 'draft' : 'stale',
-      hash: hashContent(content),
-      content,
-      updatedAt: new Date().toISOString()
-    };
-    this.store.upsertDocument(next);
-    return next;
+    return this.withDocumentLock(filePath, async () => {
+      const stored = this.store.getDocument(projectId, docId) ?? existing;
+      const diskContent = await readFile(filePath, 'utf8');
+      const current = this.documentFromContent(stored, diskContent);
+      if (current.hash !== stored.hash) this.store.upsertDocument(current);
+      if (expectedHash !== current.hash) throw this.staleDocumentError(current);
+
+      await mkdir(dirname(filePath), { recursive: true });
+      const temp = resolve(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.loop-tmp`);
+      let renamed = false;
+      try {
+        await writeFile(temp, content, { encoding: 'utf8', flag: 'wx' });
+        const latestDiskContent = await readFile(filePath, 'utf8');
+        const latest = this.documentFromContent(current, latestDiskContent);
+        if (latest.hash !== expectedHash) {
+          if (latest.hash !== current.hash) this.store.upsertDocument(latest);
+          throw this.staleDocumentError(latest);
+        }
+        await rename(temp, filePath);
+        renamed = true;
+      } finally {
+        if (!renamed) await rm(temp, { force: true });
+      }
+      const next = this.documentFromContent(current, content);
+      this.store.upsertDocument(next);
+      return next;
+    });
   }
 }

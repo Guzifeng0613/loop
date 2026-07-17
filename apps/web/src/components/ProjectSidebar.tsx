@@ -5,7 +5,7 @@ import { AddProjectDialog } from './AddProjectDialog';
 
 const stateLabels: Record<string, string> = {
   intake: '接收问题', clarifying: '深究中', doc_review: '待确认', ready: '可执行', decomposing: '拆分中',
-  executing: '执行中', integrating: '集成中', verifying: '验证中', optimizing: '优化中', completed: '已完成',
+    executing: '执行中', integrating: '集成中', verifying: '验证中', optimizing: '优化中', awaiting_acceptance: '等待验收', completed: '已完成',
   paused: '已暂停', failed: '失败', cancelled: '已取消'
 };
 

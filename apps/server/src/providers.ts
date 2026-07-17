@@ -24,10 +24,12 @@ export async function completeWithRetry(
   adapter: ProviderAdapter,
   input: ProviderTurnInput,
   signal?: AbortSignal,
-  maxAttempts = 4
+  maxAttempts = 4,
+  onAttempt?: (attempt: number) => void
 ): Promise<ProviderTurnResult> {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
+      onAttempt?.(attempt + 1);
       return await adapter.completeTurn(input, signal);
     } catch (error) {
       if (signal?.aborted) throw error;
@@ -44,36 +46,42 @@ export async function completeWithRetry(
 
 class OpenAIAdapter implements ProviderAdapter {
   readonly id = 'openai' as const;
-  constructor(private readonly apiKey: string) {}
+  private readonly client: OpenAI;
+
+  constructor(apiKey: string) {
+    this.client = new OpenAI({ apiKey });
+  }
 
   async testConnection(): Promise<boolean> {
-    const client = new OpenAI({ apiKey: this.apiKey });
-    await client.models.list();
+    await this.client.models.list();
     return true;
   }
 
   async listModels(): Promise<string[]> {
-    const client = new OpenAI({ apiKey: this.apiKey });
-    const page = await client.models.list();
+    const page = await this.client.models.list();
     return page.data.map((model) => model.id).filter((id) => id.startsWith('gpt-')).sort();
   }
 
   async completeTurn(input: ProviderTurnInput, signal?: AbortSignal): Promise<ProviderTurnResult> {
-    const client = new OpenAI({ apiKey: this.apiKey });
-    const response = await client.responses.create({
+    const response = await this.client.responses.create({
       model: input.model,
       instructions: input.systemPrompt,
       input: input.messages.map((message) => ({
         role: message.role === 'tool' ? 'user' : message.role,
         content: message.content
       })),
-      store: false
-    }, signal ? { signal } : undefined);
+      store: false,
+      ...(input.jsonMode ? { text: { format: { type: 'json_object' as const } } } : {})
+    }, {
+      ...(signal ? { signal } : {}),
+      ...(input.idempotencyKey ? { headers: { 'Idempotency-Key': input.idempotencyKey } } : {})
+    });
     return {
       text: response.output_text,
       inputTokens: response.usage?.input_tokens ?? 0,
       outputTokens: response.usage?.output_tokens ?? 0,
-      finishReason: response.status ?? 'completed'
+      finishReason: response.status ?? 'completed',
+      providerRequestId: response.id
     };
   }
 }
@@ -82,10 +90,14 @@ class DeepSeekAdapter implements ProviderAdapter {
   readonly id = 'deepseek' as const;
   constructor(private readonly apiKey: string) {}
 
-  private async request(body: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
+  private async request(body: Record<string, unknown>, signal?: AbortSignal, idempotencyKey?: string): Promise<any> {
     const response = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {})
+      },
       body: JSON.stringify(body),
       ...(signal ? { signal } : {})
     });
@@ -114,17 +126,20 @@ class DeepSeekAdapter implements ProviderAdapter {
       model: input.model,
       messages: [{ role: 'system', content: input.systemPrompt }, ...input.messages],
       ...(input.jsonMode ? { response_format: { type: 'json_object' } } : {})
-    }, signal);
+    }, signal, input.idempotencyKey);
     return {
       text: response.choices?.[0]?.message?.content ?? '',
       inputTokens: response.usage?.prompt_tokens ?? 0,
       outputTokens: response.usage?.completion_tokens ?? 0,
-      finishReason: response.choices?.[0]?.finish_reason ?? 'completed'
+      finishReason: response.choices?.[0]?.finish_reason ?? 'completed',
+      ...(response.id ? { providerRequestId: String(response.id) } : {})
     };
   }
 }
 
 export class ProviderRegistry {
+  private readonly modelCache = new Map<ProviderId, { models: string[]; expiresAt: number }>();
+
   constructor(private readonly credentials: CredentialStore) {}
 
   async get(id: ProviderId): Promise<ProviderAdapter | undefined> {
@@ -133,6 +148,30 @@ export class ProviderRegistry {
     if (id === 'openai') return new OpenAIAdapter(key);
     if (id === 'deepseek') return new DeepSeekAdapter(key);
     return undefined;
+  }
+
+  async test(id: ProviderId): Promise<{ ready: boolean; models: string[]; error?: string }> {
+    if (id === 'local-demo') return { ready: true, models: ['local-structured-demo'] };
+    const adapter = await this.get(id);
+    if (!adapter) return { ready: false, models: [], error: 'PROVIDER_NOT_CONFIGURED' };
+    try {
+      await adapter.testConnection();
+      const models = await this.models(id, true);
+      return { ready: true, models };
+    } catch (error) {
+      return { ready: false, models: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async models(id: ProviderId, refresh = false): Promise<string[]> {
+    if (id === 'local-demo') return ['local-structured-demo'];
+    const cached = this.modelCache.get(id);
+    if (!refresh && cached && cached.expiresAt > Date.now()) return cached.models;
+    const adapter = await this.get(id);
+    if (!adapter) throw new Error(`PROVIDER_NOT_CONFIGURED: ${id} 未配置有效凭据`);
+    const models = await adapter.listModels();
+    this.modelCache.set(id, { models, expiresAt: Date.now() + 5 * 60_000 });
+    return models;
   }
 
   async configs(): Promise<ProviderConfig[]> {

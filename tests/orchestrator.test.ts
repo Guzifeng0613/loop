@@ -26,7 +26,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 35_000): Promise<vo
 }
 
 describe('multi-agent orchestrator', () => {
-  it('decomposes an approved local run into isolated module agents and reaches integration approval', async () => {
+  it('decomposes an approved local run, integrates exact artifacts and waits for user acceptance', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'loop-project-'));
     const worktreesRoot = await mkdtemp(resolve(tmpdir(), 'loop-worktrees-'));
     temporaryPaths.push(root, worktreesRoot);
@@ -36,6 +36,14 @@ describe('multi-agent orchestrator', () => {
     ]) {
       await writeFile(resolve(root, 'docs', filename), `---\nloop_schema: 1\ndoc_id: ${id}\nversion: 0.1.0\nstatus: approved\n---\n\n# ${id}\n`, 'utf8');
     }
+    await writeFile(resolve(root, 'package.json'), JSON.stringify({
+      name: 'loop-fixture', private: true,
+      scripts: {
+        test: 'node -e "process.exit(0)"',
+        typecheck: 'node -e "process.exit(0)"',
+        build: 'node -e "process.exit(0)"'
+      }
+    }), 'utf8');
     expect((await runProcess('git init', root)).code).toBe(0);
     await runProcess("git config user.email 'loop@example.local'", root);
     await runProcess("git config user.name 'Loop Test'", root);
@@ -48,32 +56,42 @@ describe('multi-agent orchestrator', () => {
     const project = store.createProject({ name: 'fixture', rootPath: root, isGit: true });
     const documents = new DocumentService(store);
     await documents.syncProject(project.id, root);
-    for (const doc of store.listDocuments(project.id)) store.approveDocument(project.id, doc.id);
     const run = store.createRun({
       projectId: project.id,
       title: 'fixture run',
       question: 'validate orchestration',
       modelMode: 'fixed',
+      executionMode: 'multi_agent',
       providerId: 'local-demo',
       model: 'local-structured-demo'
     });
-    store.updateRun(run.id, { state: 'ready', previousState: 'doc_review', docsApproved: true });
     const orchestrator = new Orchestrator(
       store,
       documents,
       new ProviderRegistry(new CredentialStore()),
       new WorktreeManager(worktreesRoot)
     );
+    await orchestrator.approveAllDocuments(run.id);
 
     await orchestrator.execute(run.id);
-    await waitFor(() => ['paused', 'failed'].includes(store.getRun(run.id)?.state ?? ''));
+    await waitFor(() => ['awaiting_acceptance', 'failed', 'paused'].includes(store.getRun(run.id)?.state ?? ''));
     expect(store.getRun(run.id)?.state, store.getRun(run.id)?.pauseReason).toBe('paused');
+    const verificationApproval = store.listApprovals(run.id).find((approval) => approval.tool === 'integration_verification');
+    expect(verificationApproval?.reusable).toBe(false);
+    store.resolveApproval(verificationApproval!.id, 'approved', 'once');
+    store.updateRun(run.id, { state: 'integrating', previousState: 'paused', blocker: null, pauseReason: null });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    await orchestrator.integrate(run.id);
+    expect(store.getRun(run.id)?.state, store.getRun(run.id)?.pauseReason).toBe('awaiting_acceptance');
 
     const tasks = store.listTasks(run.id);
     const agents = store.listAgents(run.id);
     expect(tasks).toHaveLength(5);
     expect(tasks.every((task) => task.status === 'completed')).toBe(true);
     expect(agents.filter((agent) => agent.role === 'module-main')).toHaveLength(5);
-    expect(store.listApprovals(run.id).some((approval) => approval.tool === 'merge_integration')).toBe(true);
+    expect(store.listApprovals(run.id).some((approval) => approval.tool === 'integration_verification')).toBe(true);
+    expect(store.getDeliverySummary(run.id)?.taskResults).toHaveLength(5);
+    await orchestrator.acceptDelivery(run.id, 'accept_keep_branch');
+    expect(store.getRun(run.id)?.state).toBe('completed');
   }, 50_000);
 });
