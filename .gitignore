@@ -1,0 +1,288 @@
+# =============================================================================
+# .gitignore — Loop
+# 覆盖：操作系统 / 编辑器与 IDE / 环境变量与日志 / 常见语言与运行时
+# 如确定技术栈，可按需删除无关部分。
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 操作系统生成文件
+# -----------------------------------------------------------------------------
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+*.swo
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# -----------------------------------------------------------------------------
+# 编辑器与 IDE
+# -----------------------------------------------------------------------------
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.history/
+*.code-workspace
+
+# JetBrains (IntelliJ IDEA / PyCharm / WebStorm / GoLand / CLion 等)
+.idea/
+*.iml
+*.ipr
+*.iws
+.idea_modules/
+out/
+cmake-build-*/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Vim / Neovim
+[._]*.s[a-v][a-z]
+*.swp
+*.swo
+*.un~
+Session.vim
+tags
+
+# Emacs
+\#*\#
+.\#*
+*~
+\*.elc
+auto-save-list
+
+# Eclipse / Spring Tool Suite
+.settings/
+.project
+.classpath
+.factorypath
+.springBeans
+.sts4-cache/
+
+# NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+
+# -----------------------------------------------------------------------------
+# 环境变量、密钥与本地配置
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.keystore
+secrets.*
+config.local.*
+
+# -----------------------------------------------------------------------------
+# 日志、临时文件与缓存
+# -----------------------------------------------------------------------------
+*.log
+logs/
+*.tmp
+*.temp
+*.bak
+*.cache
+.cache/
+tmp/
+temp/
+
+# -----------------------------------------------------------------------------
+# Node.js（npm / yarn / pnpm）
+# -----------------------------------------------------------------------------
+node_modules/
+jspm_packages/
+.npm
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.lerna-cache/
+dist/
+dist-ssr/
+build/
+.next/
+.nuxt/
+.output/
+.vercel/
+.netlify/
+.turbo/
+.parcel-cache/
+.vite/
+*.tsbuildinfo
+coverage/
+.nyc_output/
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.ipynb_checkpoints
+.python-version
+
+# -----------------------------------------------------------------------------
+# Java（Maven / Gradle）
+# -----------------------------------------------------------------------------
+target/
+*.class
+*.war
+*.nar
+*.ear
+*.jar
+*.gradle
+!**/gradle-wrapper.jar
+.gradle/
+gradl-app/
+local.properties
+
+# -----------------------------------------------------------------------------
+# Go
+# -----------------------------------------------------------------------------
+*.exe
+*.exe~
+*.dll
+*.test
+*.out
+vendor/
+go.work
+go.work.sum
+
+# -----------------------------------------------------------------------------
+# Rust / Cargo
+# -----------------------------------------------------------------------------
+target/
+Cargo.lock.bak
+
+# -----------------------------------------------------------------------------
+# C / C++
+# -----------------------------------------------------------------------------
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.d
+*.gcda
+*.gcno
+*.lcov
+CMakeFiles/
+CMakeCache.txt
+Testing/
+
+# -----------------------------------------------------------------------------
+# 数据库与数据文件（按需启用）
+# -----------------------------------------------------------------------------
+# *.sqlite
+# *.sqlite3
+# *.db
+# *.sql.gz
+# data/
+# datasets/
+
+# -----------------------------------------------------------------------------
+# 打包与压缩文件
+# -----------------------------------------------------------------------------
+*.7z
+*.gz
+*.zip
+*.rar
+*.tar
+*.tgz
