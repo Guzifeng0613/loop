@@ -1,5 +1,5 @@
 import { Check, KeyRound, Shield, X } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { LoopController } from '../useLoop';
 import { useDialog } from '../useDialog';
 
@@ -12,6 +12,10 @@ export function SettingsPanel({ controller, onClose }: { controller: LoopControl
   const [autoMode, setAutoMode] = useState(controller.data.settings.autoMode);
   const [budget, setBudget] = useState(controller.data.settings.budget);
   const dialogRef = useDialog<HTMLElement>(onClose);
+  useEffect(() => {
+    void controller.loadDiagnostics().catch(() => undefined);
+  }, [controller.loadDiagnostics]);
+  const diagnostics = controller.diagnostics;
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section ref={dialogRef} tabIndex={-1} className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -36,6 +40,18 @@ export function SettingsPanel({ controller, onClose }: { controller: LoopControl
             <label><span>运行分钟</span><input type="number" min="1" value={budget.maxMinutes} onChange={(event) => setBudget((current) => ({ ...current, maxMinutes: Number(event.target.value) }))} /></label>
           </div></section>
           <section className="budget-summary"><div><span>已用调用</span><strong>{controller.data.usage.calls}</strong></div><div><span>已用输入</span><strong>{controller.data.usage.inputTokens.toLocaleString()}</strong></div><div><span>已运行</span><strong>{Math.round(controller.data.usage.elapsedMinutes)}m</strong></div></section>
+          <section className="settings-section"><div className="settings-section-title"><Shield size={18} /><div><strong>运行诊断</strong><span>用于核对恢复、预算与本地存储一致性</span></div></div>
+            {controller.diagnosticsStatus === 'loading' ? <div className="diagnostics-status">正在读取诊断快照…</div> : null}
+            {controller.diagnosticsStatus === 'error' ? <div className="diagnostics-status warning">{controller.diagnosticsError ?? '诊断读取失败'}</div> : null}
+            {diagnostics ? <div className="diagnostics-grid">
+              <div><span>数据库</span><strong>{diagnostics.database.integrity}</strong><small>schema v{diagnostics.database.schemaVersion} · WAL {Math.round(diagnostics.database.walBytes / 1024).toLocaleString()} KB</small></div>
+              <div><span>未知操作</span><strong>{diagnostics.operations.unknown}</strong><small>{diagnostics.operations.pending} 个操作尚未结束</small></div>
+              <div><span>未知预算</span><strong>{diagnostics.budgets.unknown}</strong><small>{diagnostics.budgets.queued + diagnostics.budgets.dispatched} 笔排队或派发中</small></div>
+              <div><span>Worktree</span><strong>{diagnostics.worktrees.orphaned}</strong><small>{Math.round(diagnostics.worktrees.usedBytes / 1024 / 1024).toLocaleString()} / {Math.round(diagnostics.worktrees.quotaBytes / 1024 / 1024).toLocaleString()} MB</small></div>
+              <div><span>事件水位</span><strong>{diagnostics.eventWatermark}</strong><small>快照生成于 {new Date(diagnostics.createdAt).toLocaleTimeString('zh-CN')}</small></div>
+              <div><span>供应商</span><strong>{diagnostics.providers.filter((provider) => provider.ready).length}/{diagnostics.providers.length}</strong><small>已就绪</small></div>
+            </div> : null}
+          </section>
         </div>
         <footer><button className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={controller.working} onClick={() => void controller.saveSettings({ concurrency, maxDepth, maxAgents, mainDirectLimit, autoMode, budget }).then(onClose)}>保存设置</button></footer>
       </section>

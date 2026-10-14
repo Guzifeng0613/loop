@@ -1,9 +1,24 @@
 import { startTransition, useCallback, useEffect, useRef, useState } from 'react';
 import { runEventSchema, runStateSchema } from '@loop/contracts';
-import type { AppSettings, BootstrapPayload, DeliverySummary, LoopDocument, RunEvent, ViewMode } from '@loop/contracts';
-import { api } from './api';
+import type { AppSettings, BootstrapPayload, DeliverySummary, Diagnostics, LoopDocument, RunEvent, RunRecoveryDecision, RunRecoverySummary, ViewMode } from '@loop/contracts';
+import { api, ApiError } from './api';
+
+export function friendlyLoopError(reason: unknown): string {
+  if (reason instanceof ApiError) {
+    const messages: Record<string, string> = {
+      WORKTREE_DIRTY: '项目有未提交改动。请先提交或清理 Git 工作区，再开始拆分执行。',
+      PROJECT_NOT_GIT: '项目还不是 Git 仓库。请先初始化 Git，再开始拆分执行。',
+      DOCS_NOT_APPROVED: '规范文档尚未全部批准，或批准后内容发生了变化。请回到“规范”阶段核对。',
+      RUN_STATE_CONFLICT: '当前运行状态不允许这个操作，请等待当前阶段完成或刷新运行。',
+      PROVIDER_NOT_CONFIGURED: '当前模型供应商尚未配置，请前往设置完成配置，或启用本地演示模式。'
+    };
+    return messages[reason.code] ?? reason.message;
+  }
+  return reason instanceof Error ? reason.message : String(reason);
+}
 
 const emptyPayload: BootstrapPayload = {
+  schemaVersion: 2,
   sessionToken: '', projects: [], runs: [], messages: [], documents: [], tasks: [], agents: [], approvals: [], events: [],
   usage: { calls: 0, inputTokens: 0, outputTokens: 0, estimatedCost: 0, elapsedMinutes: 0 }, providers: [],
   settings: { concurrency: 2, maxDepth: 1, maxAgents: 12, mainDirectLimit: 8, autoMode: false, budget: { maxCalls: 200, maxInputTokens: 5_000_000, maxOutputTokens: 500_000, maxMinutes: 120 } }
@@ -13,6 +28,13 @@ type DeliveryLoadState = {
   runId?: string;
   status: 'idle' | 'loading' | 'ready' | 'error';
   data?: DeliverySummary;
+  error?: string;
+};
+
+type RecoveryLoadState = {
+  runId?: string;
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  data?: RunRecoverySummary;
   error?: string;
 };
 
@@ -53,7 +75,11 @@ export function useLoop() {
   const [error, setError] = useState<string>();
   const [connectionState, setConnectionState] = useState<'connecting' | 'live' | 'reconnecting' | 'offline'>('offline');
   const [deliveryState, setDeliveryState] = useState<DeliveryLoadState>({ status: 'idle' });
+  const [recoveryState, setRecoveryState] = useState<RecoveryLoadState>({ status: 'idle' });
+  const [diagnosticsState, setDiagnosticsState] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; data?: Diagnostics; error?: string }>({ status: 'idle' });
+  const [projectCheck, setProjectCheck] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; data?: { projectId: string; isGit: boolean; clean: boolean; branch: string | null; changedFiles: string[] }; error?: string }>({ status: 'idle' });
   const [deliveryRefreshVersion, setDeliveryRefreshVersion] = useState(0);
+  const [recoveryRefreshVersion, setRecoveryRefreshVersion] = useState(0);
   const refreshTimer = useRef<number | undefined>(undefined);
   const resyncingRunId = useRef<string | undefined>(undefined);
   const lastEventId = useRef(0);
@@ -87,7 +113,7 @@ export function useLoop() {
       setError(undefined);
       return true;
     } catch (reason) {
-      if (sequence === refreshSequence.current) setError(reason instanceof Error ? reason.message : String(reason));
+      if (sequence === refreshSequence.current) setError(friendlyLoopError(reason));
       return false;
     } finally {
       refreshInFlight.current = Math.max(0, refreshInFlight.current - 1);
@@ -96,6 +122,19 @@ export function useLoop() {
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    const projectId = data.currentProject?.id;
+    if (!projectId) { setProjectCheck({ status: 'idle' }); return; }
+    let active = true;
+    setProjectCheck({ status: 'loading' });
+    void api.checkProject(projectId).then((result) => {
+      if (active) setProjectCheck({ status: 'ready', data: result });
+    }).catch((reason) => {
+      if (active) setProjectCheck({ status: 'error', error: friendlyLoopError(reason) });
+    });
+    return () => { active = false; };
+  }, [data.currentProject?.id, data.currentRun?.updatedAt]);
 
   useEffect(() => {
     if (data.currentRun?.state !== 'awaiting_acceptance') {
@@ -119,6 +158,27 @@ export function useLoop() {
       });
     return () => { active = false; };
   }, [data.currentRun?.id, data.currentRun?.state, deliveryRefreshVersion]);
+
+  useEffect(() => {
+    if (!data.currentRun || !['paused', 'failed'].includes(data.currentRun.state) || !data.currentRun.blocker) {
+      setRecoveryState({ status: 'idle' });
+      return;
+    }
+    const runId = data.currentRun.id;
+    let active = true;
+    setRecoveryState({ runId, status: 'loading' });
+    void api.getRecovery(runId)
+      .then((result) => {
+        if (!active) return;
+        setRecoveryState({ runId, status: 'ready', data: result });
+      })
+      .catch((reason) => {
+        if (!active) return;
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setRecoveryState({ runId, status: 'error', error: message });
+      });
+    return () => { active = false; };
+  }, [data.currentRun?.id, data.currentRun?.state, data.currentRun?.blocker?.code, recoveryRefreshVersion]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -217,7 +277,7 @@ export function useLoop() {
       if (activeRunId.current === subscribedRunId) setConnectionState(navigator.onLine ? 'reconnecting' : 'offline');
     };
     source.addEventListener('loop.heartbeat', receiveHeartbeat as EventListener);
-    const eventNames = ['message.delta', 'message.completed', 'run.state', 'agent.state', 'task.state', 'task.result', 'artifact.updated', 'delivery.updated', 'tool.output', 'approval.requested', 'approval.resolved', 'budget.updated', 'doc.invalidated', 'loop.error'];
+    const eventNames = ['message.delta', 'message.completed', 'run.state', 'agent.state', 'task.state', 'task.result', 'artifact.updated', 'delivery.updated', 'tool.output', 'approval.requested', 'approval.resolved', 'budget.updated', 'recovery.decided', 'doc.invalidated', 'loop.error'];
     for (const eventName of eventNames) source.addEventListener(eventName, receive as EventListener);
 
     return () => {
@@ -275,7 +335,7 @@ export function useLoop() {
       await refresh();
       return result;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(friendlyLoopError(reason));
       throw reason;
     } finally {
       setWorking(false);
@@ -306,17 +366,52 @@ export function useLoop() {
     ? 'idle'
     : deliveryState.runId === currentRunId ? deliveryState.status : 'loading';
   const deliveryError = deliveryState.runId === currentRunId ? deliveryState.error : undefined;
+  const recovery = recoveryState.status === 'ready' && recoveryState.runId === currentRunId ? recoveryState.data : undefined;
+  const recoveryStatus = data.currentRun && ['paused', 'failed'].includes(data.currentRun.state)
+    ? recoveryState.runId === currentRunId ? recoveryState.status : 'loading'
+    : 'idle';
+  const recoveryError = recoveryState.runId === currentRunId ? recoveryState.error : undefined;
+  const diagnostics = diagnosticsState.status === 'ready' ? diagnosticsState.data : undefined;
+  const loadDiagnostics = useCallback(() => {
+    setDiagnosticsState({ status: 'loading' });
+    return api.getDiagnostics()
+      .then((result) => {
+        setDiagnosticsState({ status: 'ready', data: result });
+        return result;
+      })
+      .catch((reason) => {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setDiagnosticsState({ status: 'error', error: message });
+        throw reason;
+      });
+  }, []);
 
   return {
-    data, delivery, deliveryStatus, deliveryError, view, loading, working, error, connectionState, setView,
+    data, delivery, deliveryStatus, deliveryError, recovery, recoveryStatus, recoveryError, projectCheck,
+    diagnostics, diagnosticsStatus: diagnosticsState.status, diagnosticsError: diagnosticsState.error,
+    view, loading, working, error, connectionState, setView,
     selectRun: (runId: string) => refresh({ runId, ...(data.currentProject?.id ? { projectId: data.currentProject.id } : {}) }),
     selectProject: (projectId: string) => refresh({ projectId }),
     sendMessage: (content: string) => data.currentRun && perform(() => api.sendMessage(data.currentRun!.id, content)),
     approveDocs: () => data.currentRun && perform(() => api.approveAllDocs(data.currentRun!.id)),
     loadDocument,
     saveDocument,
-    execute: () => data.currentRun && perform(() => api.execute(data.currentRun!.id)),
+    execute: async () => {
+      if (!data.currentRun) return;
+      if (projectCheck.status === 'ready' && (!projectCheck.data?.isGit || !projectCheck.data.clean)) {
+        setError(!projectCheck.data?.isGit ? '项目还不是 Git 仓库。请先初始化 Git，再开始拆分执行。' : '项目有未提交改动。请先提交或清理 Git 工作区，再开始拆分执行。');
+        return;
+      }
+      return perform(() => api.execute(data.currentRun!.id));
+    },
     runAction: (action: 'pause' | 'resume' | 'cancel' | 'retry') => data.currentRun && perform(() => api.runAction(data.currentRun!.id, action)),
+    recoverRun: (decision: RunRecoveryDecision, note?: string) => data.currentRun && perform(async () => {
+      const summary = await api.recoverRun(data.currentRun!.id, decision, note);
+      setRecoveryState({ runId: data.currentRun!.id, status: 'ready', data: summary });
+      setRecoveryRefreshVersion((current) => current + 1);
+      return summary;
+    }),
+    loadDiagnostics,
     acceptDelivery: (decision: 'accept_keep_branch' | 'accept_merge' | 'request_changes' | 'discard', feedback?: string) => {
       const run = data.currentRun;
       if (!run) return undefined;
@@ -341,7 +436,7 @@ export function useLoop() {
         const run = await api.createRun(input);
         await refresh({ runId: run.id, projectId: input.projectId });
       } catch (reason) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        setError(friendlyLoopError(reason));
         throw reason;
       } finally {
         setWorking(false);

@@ -22,6 +22,8 @@ import {
   projectSchema,
   providerConfigSchema,
   resolveApprovalRequestSchema,
+  runRecoveryRequestSchema,
+  runRecoverySummarySchema,
   runActionRequestSchema,
   runConfigSnapshotSchema,
   runEventV2Schema,
@@ -49,6 +51,7 @@ const schemas = {
   CreateMessageRequest: jsonSchema(createMessageRequestSchema),
   CreateRunRequest: jsonSchema(createRunRequestSchema),
   RunActionRequest: jsonSchema(runActionRequestSchema),
+  RunRecoveryRequest: jsonSchema(runRecoveryRequestSchema),
   ResolveApprovalRequest: jsonSchema(resolveApprovalRequestSchema),
   AcceptanceRequest: jsonSchema(acceptanceRequestSchema),
   OperationRecoveryRequest: jsonSchema(operationRecoveryRequestSchema),
@@ -56,6 +59,7 @@ const schemas = {
   SaveDocumentRequest: jsonSchema(saveDocumentRequestSchema),
   Project: jsonSchema(projectSchema),
   Run: jsonSchema(runSchema),
+  RunRecoverySummary: jsonSchema(runRecoverySummarySchema),
   ChatMessage: jsonSchema(chatMessageSchema),
   LoopDocument: jsonSchema(loopDocumentSchema),
   TaskSpec: jsonSchema(taskSpecSchema),
@@ -110,6 +114,10 @@ export const openApiDocument = {
     '/runs/{id}': {
       get: { operationId: 'getRun', parameters: idParameter(), responses: entityResponse('Run') },
       patch: mutation('changeRunState', 'RunActionRequest', 'Run', idParameter())
+    },
+    '/runs/{id}/recovery': {
+      get: readEntity('getRunRecovery', 'RunRecoverySummary'),
+      post: mutation('recoverRun', 'RunRecoveryRequest', 'RunRecoverySummary', idParameter())
     },
     '/runs/{id}/messages': {
       get: readCollection('listMessages', 'PageChatMessage'),

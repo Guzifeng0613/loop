@@ -1,4 +1,4 @@
-import type { AppSettings, BootstrapPayload, DeliverySummary, LoopDocument, ProviderId, Run, ToolOutput } from '@loop/contracts';
+import type { AppSettings, BootstrapPayload, DeliverySummary, Diagnostics, LoopDocument, ProviderId, Run, RunRecoveryDecision, RunRecoverySummary, ToolOutput } from '@loop/contracts';
 
 export class ApiError extends Error {
   constructor(readonly code: string, message: string) {
@@ -37,6 +37,10 @@ export const api = {
   saveDocument: (runId: string, document: LoopDocument, content: string) => request<LoopDocument>(`/runs/${runId}/docs/${document.id}`, { method: 'PATCH', body: JSON.stringify({ content }) }),
   execute: (runId: string) => request(`/runs/${runId}/execute`, { method: 'POST' }),
   runAction: (runId: string, action: 'pause' | 'resume' | 'cancel' | 'retry') => request(`/runs/${runId}`, { method: 'PATCH', body: JSON.stringify({ action }) }),
+  getRecovery: (runId: string) => request<RunRecoverySummary>(`/runs/${runId}/recovery`),
+  recoverRun: (runId: string, decision: RunRecoveryDecision, note?: string) =>
+    request<RunRecoverySummary>(`/runs/${runId}/recovery`, { method: 'POST', body: JSON.stringify({ decision, ...(note ? { note } : {}) }) }),
+  getDiagnostics: () => request<Diagnostics>('/diagnostics'),
   getDelivery: (runId: string) => request<DeliverySummary>(`/runs/${runId}/delivery`),
   acceptDelivery: (runId: string, decision: 'accept_keep_branch' | 'accept_merge' | 'request_changes' | 'discard', feedback?: string) =>
     request(`/runs/${runId}/acceptance`, { method: 'POST', body: JSON.stringify({ decision, ...(feedback ? { feedback } : {}) }) }),
@@ -55,6 +59,8 @@ export const api = {
   saveProvider: (providerId: 'openai' | 'deepseek', apiKey: string) => request(`/providers/${providerId}`, { method: 'PATCH', body: JSON.stringify({ apiKey }) }),
   clearProvider: (providerId: 'openai' | 'deepseek') => request(`/providers/${providerId}`, { method: 'PATCH', body: JSON.stringify({ clear: true }) }),
   saveSettings: (settings: Partial<AppSettings>) => request('/settings', { method: 'PATCH', body: JSON.stringify(settings) }),
+  pickProjectDirectory: () => request<{ path: string | null; cancelled: boolean }>('/projects/pick-directory'),
+  checkProject: (projectId: string) => request<{ projectId: string; isGit: boolean; clean: boolean; branch: string | null; changedFiles: string[] }>(`/projects/${projectId}/check`),
   createProject: (rootPath: string) => request('/projects', { method: 'POST', body: JSON.stringify({ rootPath }) }),
   createRun: (input: { projectId: string; title: string; question: string; modelMode: 'fixed' | 'auto'; providerId: ProviderId; model: string; allowedProviderIds: ProviderId[] }) =>
     request<Run>('/runs', { method: 'POST', body: JSON.stringify(input) }),

@@ -51,11 +51,11 @@ export function ProjectSidebar({ controller, onNewRun }: { controller: LoopContr
         <button className="icon-button" aria-label="添加项目" title="添加项目" onClick={() => setAddProjectOpen(true)}><Plus size={17} /></button>
       </div>
 
-      <div className={`git-gate ${data.currentProject?.isGit ? 'safe' : 'attention'}`}>
-        {data.currentProject?.isGit ? <ShieldCheck size={16} /> : <ShieldAlert size={16} />}
+      <div className={`git-gate ${data.currentProject?.isGit && controller.projectCheck?.data?.clean !== false ? 'safe' : 'attention'}`}>
+        {data.currentProject?.isGit && controller.projectCheck?.data?.clean !== false ? <ShieldCheck size={16} /> : <ShieldAlert size={16} />}
         <div>
-          <strong>{data.currentProject?.isGit ? 'Git 隔离可用' : '执行门禁未满足'}</strong>
-          <span>{data.currentProject?.isGit ? '任务将进入独立 worktree' : '可继续澄清；执行前需初始化 Git'}</span>
+          <strong>{!data.currentProject?.isGit ? '需要初始化 Git' : controller.projectCheck?.data?.clean === false ? '工作区有未提交改动' : 'Git 隔离可用'}</strong>
+          <span>{!data.currentProject?.isGit ? '可继续澄清；执行前需初始化 Git' : controller.projectCheck?.data?.clean === false ? `${controller.projectCheck.data.changedFiles.length} 个文件待提交或清理` : '任务将进入独立 worktree'}</span>
         </div>
       </div>
 

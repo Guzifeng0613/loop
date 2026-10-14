@@ -1,14 +1,45 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+*.tsbuildinfo
 .vite/
+
+# Test & coverage
 coverage/
 playwright-report/
 test-results/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime data & local workbench state
 .loop/
+output/
+
+# Databases (SQLite)
 *.db
 *.db-shm
 *.db-wal
+
+# Environment variables
 .env
 .env.*
 !.env.example
 
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

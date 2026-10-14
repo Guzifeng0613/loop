@@ -211,6 +211,48 @@ describe('local REST API', () => {
     expect(context.store.getApproval(approval.id)?.status).toBe('pending');
   });
 
+  it('returns structured recovery evidence and audits an idempotent recovery decision', async () => {
+    context = await createApp(':memory:');
+    const bootstrap = (await context.app.inject({ method: 'GET', url: '/api/bootstrap' })).json();
+    const runId = bootstrap.currentRun.id as string;
+    context.store.updateRun(runId, {
+      state: 'paused', previousState: 'doc_review', pauseReason: 'WORKTREE_BASE_DRIFT: test fixture',
+      blocker: {
+        kind: 'conflict', code: 'WORKTREE_BASE_DRIFT', message: '运行基线与当前 HEAD 不一致',
+        since: new Date().toISOString(), recoverable: true
+      }
+    });
+
+    const summary = await context.app.inject({ method: 'GET', url: `/api/runs/${runId}/recovery` });
+    expect(summary.statusCode).toBe(200);
+    expect(summary.json().evidence.knownFacts).toContain('阻塞代码 WORKTREE_BASE_DRIFT');
+    expect(summary.json().evidence.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'git-head', status: 'warning' })
+    ]));
+    expect(summary.json().recoveryActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ decision: 'resume', available: true, risk: 'medium' }),
+      expect.objectContaining({ decision: 'confirm_completed', available: false })
+    ]));
+
+    const headers = { 'x-loop-session': bootstrap.sessionToken, 'idempotency-key': 'recover-base-drift' };
+    const recovered = await context.app.inject({
+      method: 'POST', url: `/api/runs/${runId}/recovery`, headers,
+      payload: { decision: 'resume', note: '已人工核对 HEAD，允许返回文档评审。' }
+    });
+    expect(recovered.statusCode).toBe(200);
+    expect(context.store.getRun(runId)?.state).toBe('doc_review');
+    const decisions = context.store.listRecentEvents(runId, 50).filter((event) => event.type === 'recovery.decided');
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.payload).toMatchObject({ recovery: { decision: 'resume', fromState: 'paused', toState: 'doc_review', result: 'applied' } });
+
+    const repeated = await context.app.inject({
+      method: 'POST', url: `/api/runs/${runId}/recovery`, headers,
+      payload: { decision: 'resume', note: '已人工核对 HEAD，允许返回文档评审。' }
+    });
+    expect(repeated.statusCode).toBe(200);
+    expect(context.store.listRecentEvents(runId, 50).filter((event) => event.type === 'recovery.decided')).toHaveLength(1);
+  });
+
   it('exposes delivery/tool output and completes only after explicit acceptance', async () => {
     context = await createApp(':memory:');
     const bootstrap = (await context.app.inject({ method: 'GET', url: '/api/bootstrap' })).json();

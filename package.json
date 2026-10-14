@@ -8,14 +8,14 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "npm run build -w @loop/contracts && concurrently -k -n server,web -c blue,magenta \"npm run dev -w @loop/server\" \"npm run dev -w @loop/web\"",
-    "build": "npm run build -w @loop/contracts && npm run build -w @loop/web && npm run build -w @loop/server",
-    "pretypecheck": "npm run build -w @loop/contracts",
-    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev": "npm.cmd run build -w @loop/contracts && node scripts/dev.mjs",
+    "build": "npm.cmd run build -w @loop/contracts && npm.cmd run build -w @loop/web && npm.cmd run build -w @loop/server",
+    "pretypecheck": "npm.cmd run build -w @loop/contracts",
+    "typecheck": "npm.cmd run typecheck --workspaces --if-present",
     "lint": "eslint . --max-warnings 0",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers 1",
     "test:watch": "vitest",
-    "start": "npm run start -w @loop/server"
+    "start": "npm.cmd run start -w @loop/server"
   },
   "devDependencies": {
     "@eslint/js": "^9.31.0",

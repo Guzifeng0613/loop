@@ -6,10 +6,15 @@ import { UnderstandingCard } from './UnderstandingCard';
 export function ConversationPanel({ controller, onOpenInspector }: { controller: LoopController; onOpenInspector: () => void }) {
   const [text, setText] = useState('');
   const feedRef = useRef<HTMLDivElement>(null);
+  // Follow new/streaming messages only when the reader is already near the end.
+  // This keeps the live transcript responsive without pulling the user away
+  // from an older message they are inspecting.
   useEffect(() => {
     const feed = feedRef.current;
-    if (feed) feed.scrollTop = feed.scrollHeight;
-  }, [controller.data.messages.length]);
+    if (!feed) return;
+    const distanceFromBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight;
+    if (distanceFromBottom <= 96) feed.scrollTo({ top: feed.scrollHeight, behavior: 'smooth' });
+  }, [controller.data.messages]);
 
   const submit = async () => {
     const content = text.trim();
@@ -24,7 +29,7 @@ export function ConversationPanel({ controller, onOpenInspector }: { controller:
         <div><span className="conversation-symbol"><Sparkles size={17} /></span><div><strong>问题深究</strong><span>事实、假设与未决项分别记录</span></div></div>
         <div className="conversation-head-actions"><span className="message-count">{controller.data.messages.length} 条记录</span><button className="icon-button mobile-only" aria-label="打开运行检查器" onClick={onOpenInspector}><PanelRightOpen size={17} /></button></div>
       </div>
-      <div className="message-feed" ref={feedRef}>
+      <div className="message-feed" ref={feedRef} aria-live="polite" aria-relevant="additions text">
         {!controller.data.messages.length ? <div className="conversation-empty"><MessageSquareText size={28} /><strong>从一个清晰问题开始</strong><p>描述目标、当前状态和限制。Lead Main 会先形成结构化理解，再进入执行。</p></div> : null}
         {controller.data.messages.map((message) => (
           <div key={message.id} className={`message-entry ${message.role}`}>

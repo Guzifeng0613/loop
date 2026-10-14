@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { realpath, stat } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
@@ -12,13 +13,20 @@ import {
   createRunRequestSchema,
   paginationQuerySchema,
   resolveApprovalRequestSchema,
+  runRecoveryRequestSchema,
+  runRecoverySummarySchema,
   runActionRequestSchema,
   saveDocumentRequestSchema,
   settingsPatchSchema,
   type AppSettings,
   type BootstrapPayload,
+  type Diagnostics,
   type LoopDocument,
-  type ProviderId
+  type ProviderId,
+  type RecoveryDecisionRecord,
+  type RecoveryEvidence,
+  type RunRecoveryDecision,
+  type RunState
 } from '@loop/contracts';
 import { config, dataDirectory, repoRoot } from './config.js';
 import { CredentialStore } from './credentials.js';
@@ -30,6 +38,27 @@ import { ProviderRegistry } from './providers.js';
 import { runProcess } from './security.js';
 import { LoopStore } from './store.js';
 import { WorktreeManager } from './worktrees.js';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
+
+async function pickLocalDirectory(): Promise<{ path: string | null; cancelled: boolean }> {
+  if (process.platform !== 'win32') return { path: null, cancelled: true };
+  const script = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
+    '$dialog.Description = "选择 Loop 项目文件夹"',
+    '$dialog.ShowNewFolderButton = $false',
+    'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dialog.SelectedPath) }'
+  ].join('; ');
+  try {
+    const result = await execFileAsync('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: true, maxBuffer: 32_000 });
+    const path = result.stdout.trim();
+    return path ? { path, cancelled: false } : { path: null, cancelled: true };
+  } catch {
+    return { path: null, cancelled: true };
+  }
+}
 
 function requestId(request: FastifyRequest): string {
   return request.id;
@@ -320,6 +349,244 @@ export async function createApp(databasePath = config.databasePath): Promise<App
     return { ok: true, approval };
   }
 
+  function recoveryActionIds(details: Record<string, unknown> | undefined): string[] {
+    const ids = new Set<string>();
+    const single = details?.actionAttemptId;
+    if (typeof single === 'string') ids.add(single);
+    const many = details?.actionAttemptIds;
+    if (Array.isArray(many)) {
+      for (const item of many) if (typeof item === 'string') ids.add(item);
+    }
+    return [...ids];
+  }
+
+  function buildRecoverySummary(runId: string) {
+    const run = store.getRun(runId);
+    if (!run) throw new Error('RUN_NOT_FOUND');
+    const actionIds = recoveryActionIds(run.blocker?.details);
+    const allRecoverable = store.listRecoverableActionAttempts(runId);
+    const actionAttempts = actionIds.length
+      ? actionIds.map((id) => store.getActionAttempt(id)).filter((item): item is NonNullable<typeof item> => Boolean(item))
+      : allRecoverable;
+    const unknownBudgetReservations = store.listBudgetReservations(runId).filter((item) => item.status === 'unknown');
+    const worktreeArtifacts = store.listWorktreeArtifacts(runId);
+    const recentEvents = store.listRecentEvents(runId, 50);
+    const unknownOutcome = run.blocker?.code === 'ACTION_OUTCOME_UNKNOWN';
+    const interrupted = ['paused', 'failed'].includes(run.state);
+    const evidence = buildRecoveryEvidence(run, actionAttempts, unknownBudgetReservations, worktreeArtifacts, recentEvents);
+    const canAct = interrupted && Boolean(run.blocker?.recoverable);
+    const supportsOutcomeDecision = unknownOutcome || run.blocker?.kind === 'restart';
+    const recoveryActions = [
+      { decision: 'confirm_completed', label: '核对后确认完成', available: canAct && supportsOutcomeDecision, disabledReason: supportsOutcomeDecision ? undefined : '当前阻塞没有结果未知的动作', risk: 'high' },
+      { decision: 'fail_and_retry', label: '标记失败并重试', available: canAct && supportsOutcomeDecision, disabledReason: supportsOutcomeDecision ? undefined : '当前阻塞没有可安全重试的未知动作', risk: 'high' },
+      { decision: 'resume', label: '解决原因后继续', available: canAct && !unknownOutcome, disabledReason: unknownOutcome ? '必须先核对未知动作结果' : undefined, risk: 'medium' },
+      { decision: 'abandon_generation', label: '放弃当前 generation', available: canAct, disabledReason: canAct ? undefined : '当前运行不可恢复', risk: 'high' }
+    ] as const;
+    const decisionHistory = recentEvents.flatMap((event) => {
+      if (event.type !== 'recovery.decided' || !event.payload || typeof event.payload !== 'object') return [];
+      const recovery = (event.payload as { recovery?: unknown }).recovery;
+      return recovery ? [recovery] : [];
+    });
+    return runRecoverySummarySchema.parse({
+      run,
+      ...(run.blocker ? { blocker: run.blocker } : {}),
+      recoverable: recoveryActions.some((action) => action.available),
+      actionAttempts,
+      unknownBudgetReservations,
+      worktreeArtifacts,
+      recentEvents,
+      evidence,
+      recoveryActions,
+      decisionHistory,
+      createdAt: new Date().toISOString()
+    });
+  }
+
+  function buildRecoveryEvidence(run: NonNullable<ReturnType<LoopStore['getRun']>>, actionAttempts: ReturnType<LoopStore['listRecoverableActionAttempts']>, unknownBudgets: ReturnType<LoopStore['listBudgetReservations']>, artifacts: ReturnType<LoopStore['listWorktreeArtifacts']>, recentEvents: ReturnType<LoopStore['listRecentEvents']>): RecoveryEvidence {
+    const blockerCode = run.blocker?.code ?? 'UNKNOWN_BLOCKER';
+    const affectedResources = [
+      ...artifacts.map((artifact) => `${artifact.branch} @ ${artifact.commitSha ?? artifact.baseRef}`),
+      ...actionAttempts.map((attempt) => attempt.taskId ? `task:${attempt.taskId}` : `action:${attempt.id}`)
+    ];
+    const checks: RecoveryEvidence['checks'] = [
+      { id: 'blocker', label: '阻塞记录', status: run.blocker ? 'passed' : 'unknown', detail: run.blocker?.message ?? '没有结构化阻塞记录' },
+      { id: 'actions', label: '动作结果', status: actionAttempts.length ? 'warning' : 'passed', detail: actionAttempts.length ? `${actionAttempts.length} 个动作需要人工核对` : '没有待核对动作' },
+      { id: 'budget', label: '预算预留', status: unknownBudgets.length ? 'warning' : 'passed', detail: unknownBudgets.length ? `${unknownBudgets.length} 笔预留结果未知` : '预算记录一致' },
+      { id: 'worktree', label: 'Worktree 产物', status: artifacts.length ? 'passed' : 'unknown', detail: artifacts.length ? `${artifacts.length} 个登记产物可供核对` : '没有可核对的登记产物' },
+      { id: 'events', label: '事件线索', status: recentEvents.length ? 'passed' : 'unknown', detail: recentEvents.length ? `已加载最近 ${recentEvents.length} 条事件` : '没有事件线索' }
+    ];
+    if (['WORKTREE_BASE_DRIFT', 'INTEGRATION_CONFLICT', 'ACCEPTANCE_FAILED', 'ACTION_OUTCOME_UNKNOWN'].includes(blockerCode)) {
+      checks.push({ id: 'git-head', label: 'Git HEAD 与基线', status: 'warning', detail: `需要在 IDE 中核对运行基线 ${run.baseRef} 与当前项目 HEAD` });
+    }
+    return {
+      knownFacts: [
+        `运行在 ${run.previousState ?? run.state} 阶段中断`,
+        `阻塞代码 ${blockerCode}`,
+        `${actionAttempts.length} 个相关动作，${artifacts.length} 个 worktree 产物`
+      ],
+      unknownFacts: [
+        ...(actionAttempts.length ? ['中断前动作是否已产生完整副作用'] : []),
+        ...(unknownBudgets.length ? ['模型调用实际 token 与费用'] : []),
+        ...(['WORKTREE_BASE_DRIFT', 'INTEGRATION_CONFLICT', 'ACCEPTANCE_FAILED'].includes(blockerCode) ? ['当前 HEAD 与运行基线之间的人工变更归属'] : [])
+      ],
+      checks,
+      affectedResources,
+      actionSummaries: actionAttempts.map((attempt) => `${attempt.sequence}. ${attempt.action.type} · ${attempt.status}`),
+      ...(typeof run.blocker?.details?.currentHead === 'string' ? { currentHead: run.blocker.details.currentHead } : {})
+    };
+  }
+
+  function recordRecoveryDecision(runId: string, decision: RunRecoveryDecision, note: string | undefined, fromState: RunState, toState: RunState, blockerCode: string, evidence: RecoveryEvidence): RecoveryDecisionRecord {
+    const run = store.getRun(runId);
+    if (!run) throw new Error('RUN_NOT_FOUND');
+    const record: RecoveryDecisionRecord = {
+      id: randomUUID(), runId, generation: run.generation, decision, actor: 'local-user', note: note?.trim() ?? '',
+      fromState, toState, blockerCode, evidence, result: 'applied', createdAt: new Date().toISOString()
+    };
+    store.appendEvent(runId, 'recovery.decided', { recovery: record });
+    return record;
+  }
+
+  async function recoverRun(runId: string, decision: RunRecoveryDecision, note?: string) {
+    const run = store.getRun(runId);
+    if (!run) throw new Error('RUN_NOT_FOUND');
+    if (!['paused', 'failed'].includes(run.state)) throw new Error('RUN_STATE_CONFLICT: 只有已中断运行可以执行恢复操作');
+    if (!run.blocker?.recoverable) throw new Error('RUN_STATE_CONFLICT: 当前阻塞不可自动恢复');
+    const actionIds = recoveryActionIds(run.blocker.details);
+    const attempts = actionIds.length
+      ? actionIds.map((id) => store.getActionAttempt(id)).filter((item): item is NonNullable<typeof item> => Boolean(item))
+      : store.listRecoverableActionAttempts(runId);
+    const settleUnknownBudgets = () => {
+      for (const reservation of store.listBudgetReservations(runId).filter((item) => item.status === 'unknown')) {
+        store.settleBudgetReservation(reservation.id, {
+          calls: reservation.reservedCalls,
+          inputTokens: reservation.reservedInputTokens,
+          outputTokens: reservation.reservedOutputTokens,
+          actualCost: reservation.reservedCost
+        });
+      }
+    };
+    const target = run.previousState && !['paused', 'failed', 'cancelled', 'completed'].includes(run.previousState)
+      ? run.previousState
+      : 'executing';
+    const evidence = buildRecoveryEvidence(run, attempts, store.listBudgetReservations(runId).filter((item) => item.status === 'unknown'), store.listWorktreeArtifacts(runId), store.listRecentEvents(runId, 50));
+
+    if (decision === 'abandon_generation') {
+      orchestrator.interrupt(runId);
+      settleUnknownBudgets();
+      const project = store.getProject(run.projectId);
+      if (!project) throw new Error('PROJECT_NOT_FOUND');
+      const docRefs = store.listDocuments(project.id).map((document) => ({
+        docId: document.id,
+        version: document.version,
+        hash: document.hash,
+        sections: []
+      }));
+      store.createPlanGeneration(runId, docRefs, note?.trim() || '用户放弃结果未知的计划代次，回到规范评审');
+      store.appendEvent(runId, 'error', { code: 'RUN_GENERATION_ABANDONED', message: note?.trim() || '已放弃当前 generation，等待重新批准规范。' });
+      recordRecoveryDecision(runId, decision, note, run.state, 'doc_review', run.blocker.code, evidence);
+      return buildRecoverySummary(runId);
+    }
+
+    if (decision === 'confirm_completed') {
+      settleUnknownBudgets();
+      for (const attempt of attempts) {
+        if (['completed', 'failed', 'cancelled'].includes(attempt.status)) continue;
+        let current = attempt;
+        if (current.status === 'pending') current = store.claimActionAttempt(current.id);
+        if (current.status === 'waiting_approval') throw new Error('APPROVAL_REQUIRED: 等待审批的动作不能直接确认为完成');
+        if (current.action.type === 'call_tool') {
+          const tool = current.action.tool;
+          const output = store.createToolOutput({
+            runId,
+            ...(current.taskId ? { taskId: current.taskId } : {}),
+            actionAttemptId: current.id,
+            tool,
+            content: `人工核对确认动作已完成。${note?.trim() ? `\n\n${note.trim()}` : ''}`
+          });
+          store.completeActionAttempt(current.id, output.id);
+        } else {
+          store.completeActionAttempt(current.id);
+        }
+        if (current.taskId) {
+          const task = store.listTasks(runId).find((item) => item.id === current.taskId);
+          if (task && task.status === 'blocked') store.upsertTask({ ...task, status: 'running' });
+        }
+      }
+      const resumed = store.updateRun(runId, { state: target, previousState: run.state, blocker: null, pauseReason: null });
+      recordRecoveryDecision(runId, decision, note, run.state, resumed.state, run.blocker.code, evidence);
+      if (['decomposing', 'executing'].includes(resumed.state)) await orchestrator.execute(runId);
+      if (['integrating', 'verifying', 'optimizing'].includes(resumed.state)) await orchestrator.integrate(runId);
+      return buildRecoverySummary(runId);
+    }
+
+    if (decision === 'fail_and_retry') {
+      settleUnknownBudgets();
+      for (const attempt of attempts) {
+        if (!['completed', 'failed', 'cancelled'].includes(attempt.status)) {
+          store.failActionAttempt(attempt.id, note?.trim() || 'USER_MARKED_OUTCOME_FAILED');
+        }
+        if (attempt.taskId) {
+          const task = store.listTasks(runId).find((item) => item.id === attempt.taskId);
+          if (task && task.status === 'blocked') store.upsertTask({ ...task, status: 'running' });
+        }
+      }
+      const resumed = store.updateRun(runId, { state: target, previousState: run.state, blocker: null, pauseReason: null });
+      recordRecoveryDecision(runId, decision, note, run.state, resumed.state, run.blocker.code, evidence);
+      if (['decomposing', 'executing'].includes(resumed.state)) await orchestrator.execute(runId);
+      if (['integrating', 'verifying', 'optimizing'].includes(resumed.state)) await orchestrator.integrate(runId);
+      return buildRecoverySummary(runId);
+    }
+
+    if (run.blocker.code === 'ACTION_OUTCOME_UNKNOWN') {
+      throw new Error('RUN_STATE_CONFLICT: 结果未知的动作必须先确认完成、标记失败或放弃 generation');
+    }
+    const resumed = store.updateRun(runId, { state: target, previousState: run.state, blocker: null, pauseReason: null });
+    recordRecoveryDecision(runId, decision, note, run.state, resumed.state, run.blocker.code, evidence);
+    if (['decomposing', 'executing'].includes(resumed.state)) await orchestrator.execute(runId);
+    if (['integrating', 'verifying', 'optimizing'].includes(resumed.state)) await orchestrator.integrate(runId);
+    return buildRecoverySummary(runId);
+  }
+
+  async function buildDiagnostics(): Promise<Diagnostics> {
+    const maintenance = store.maintainDatabase('PASSIVE');
+    const schemaRow = store.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string } | undefined;
+    let walBytes = 0;
+    if (databasePath !== ':memory:' && !databasePath.startsWith('file:')) {
+      try {
+        walBytes = (await stat(`${databasePath}-wal`)).size;
+      } catch {
+        walBytes = 0;
+      }
+    }
+    const operations = store.db.prepare(`SELECT
+      SUM(CASE WHEN status IN ('prepared', 'waiting_approval', 'dispatched', 'effect_observed', 'committed') THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+      FROM operation_attempts`).get() as { pending?: number | null; unknown?: number | null };
+    const budgets = store.db.prepare(`SELECT
+      SUM(CASE WHEN status IN ('queued', 'reserved') THEN 1 ELSE 0 END) AS queued,
+      SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END) AS dispatched,
+      SUM(CASE WHEN status = 'unknown' THEN 1 ELSE 0 END) AS unknown
+      FROM budget_reservations`).get() as { queued?: number | null; dispatched?: number | null; unknown?: number | null };
+    const storage = await worktrees.storageUsage();
+    const orphaned = store.listWorktreeArtifacts(undefined, 'orphaned').length;
+    const providerConfigs = await providers.configs();
+    return {
+      schemaVersion: 2,
+      database: {
+        schemaVersion: Number(schemaRow?.value ?? 1),
+        integrity: maintenance.integrity.every((item) => item === 'ok') ? 'ok' : 'error',
+        walBytes
+      },
+      operations: { pending: Number(operations.pending ?? 0), unknown: Number(operations.unknown ?? 0) },
+      budgets: { queued: Number(budgets.queued ?? 0), dispatched: Number(budgets.dispatched ?? 0), unknown: Number(budgets.unknown ?? 0) },
+      worktrees: { usedBytes: storage.usedBytes, quotaBytes: storage.quotaBytes, orphaned },
+      providers: providerConfigs.map((provider) => ({ id: provider.id, configured: provider.configured, ready: provider.enabled && provider.configured })),
+      eventWatermark: Number((store.db.prepare('SELECT MAX(id) AS watermark FROM events').get() as { watermark?: number | null }).watermark ?? 0),
+      createdAt: new Date().toISOString()
+    };
+  }
+
   app.addHook('onRequest', async (request, reply) => {
     if (!['localhost', '127.0.0.1', '::1'].includes(request.hostname)) {
       return reply.status(403).send({ error: { code: 'ORIGIN_DENIED', message: 'Host 未获 localhost 授权。', requestId: request.id } });
@@ -396,6 +663,7 @@ export async function createApp(databasePath = config.databasePath): Promise<App
   });
 
   app.get('/api/projects', async (request) => pageCollection(store.listProjects(), request.query));
+  app.get('/api/projects/pick-directory', async () => pickLocalDirectory());
   app.post('/api/projects', async (request) => {
     return idempotent(request, 'projects:create', async () => {
       const body = createProjectRequestSchema.parse(request.body);
@@ -436,6 +704,20 @@ export async function createApp(databasePath = config.databasePath): Promise<App
       ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
       ...(query.limit === undefined ? {} : { limit: query.limit })
     });
+  });
+
+  app.get('/api/projects/:id/check', async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const project = store.getProject(id);
+    if (!project) throw new Error('PROJECT_NOT_FOUND');
+    const git = await runProcess('git rev-parse --is-inside-work-tree', project.rootPath);
+    if (git.code !== 0) return { projectId: id, isGit: false, clean: false, branch: null, changedFiles: [] };
+    const [status, branch] = await Promise.all([
+      runProcess('git status --porcelain', project.rootPath),
+      runProcess('git branch --show-current', project.rootPath)
+    ]);
+    const changedFiles = status.output.split(/\r?\n/).map((line) => line.slice(3).trim()).filter(Boolean);
+    return { projectId: id, isGit: true, clean: status.code === 0 && changedFiles.length === 0, branch: branch.output.trim() || null, changedFiles };
   });
 
   app.post('/api/runs', async (request) => {
@@ -508,6 +790,17 @@ export async function createApp(databasePath = config.databasePath): Promise<App
       if (['integrating', 'verifying', 'optimizing'].includes(resumed.state)) await orchestrator.integrate(id);
       return resumed;
     });
+  });
+
+  app.get('/api/runs/:id/recovery', async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    return buildRecoverySummary(id);
+  });
+
+  app.post('/api/runs/:id/recovery', async (request) => {
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const body = runRecoveryRequestSchema.parse(request.body);
+    return idempotent(request, `runs:${id}:recovery:${body.decision}`, () => recoverRun(id, body.decision, body.note));
   });
 
   app.get('/api/runs/:id/messages', async (request) => {
@@ -779,6 +1072,8 @@ export async function createApp(databasePath = config.databasePath): Promise<App
   });
 
   app.get('/api/openapi.json', async () => openApiDocument);
+
+  app.get('/api/diagnostics', async () => buildDiagnostics());
 
   app.get('/api/runs/:id/delivery', async (request) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);

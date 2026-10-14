@@ -41,10 +41,11 @@ export function NewRunPanel({ controller, onClose }: { controller: LoopControlle
   return (
     <div className="modal-backdrop centered" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section ref={dialogRef} tabIndex={-1} className="new-run-panel" role="dialog" aria-modal="true" aria-labelledby="new-run-title">
-        <header><div className="dialog-symbol"><Bot size={20} /></div><div><span>新建运行</span><h2 id="new-run-title">先把问题交给 Lead Main</h2></div><button className="icon-button" aria-label="关闭新建运行" onClick={onClose}><X size={18} /></button></header>
+        <header><div className="dialog-symbol"><Bot size={20} /></div><div><span>新建运行</span><h2 id="new-run-title">先把目标交给 Lead Main</h2></div><button className="icon-button" aria-label="关闭新建运行" onClick={onClose}><X size={18} /></button></header>
         <div className="new-run-form">
           <label><span>运行名称</span><input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
-          <label><span>你想解决什么问题？</span><textarea rows={7} value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="描述目标、当前状态、限制和期望结果。Lead Main 会先深究而不是立即执行。" autoFocus /></label>
+          <label><span>你想解决什么问题？</span><textarea rows={7} value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="描述目标、当前状态、限制和期望结果。Lead Main 会先生成框架，再判断哪些模块可以独立交给子 Agent。" autoFocus /></label>
+          <div className="orchestration-preview" aria-label="编排流程"><span><b>01</b>理解目标</span><i>→</i><span><b>02</b>生成框架</span><i>→</i><span><b>03</b>判断独立模块</span><i>→</i><span><b>04</b>分发子 Agent</span></div>
           {!controller.data.currentProject ? <p className="form-warning" role="alert">请先添加并选择本地项目，才能创建运行。</p> : null}
           {!realProviders.length ? <p className="form-warning" role="status">尚未配置真实模型供应商。可先前往设置填写凭据，或明确启用下方演示模式。</p> : null}
           <label className="demo-mode-confirm"><input type="checkbox" checked={demoMode} onChange={(event) => {

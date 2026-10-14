@@ -335,6 +335,54 @@ export const runActionRequestSchema = z.object({
   action: z.enum(['pause', 'resume', 'cancel', 'retry'])
 }).strict();
 
+export const runRecoveryDecisionSchema = z.enum(['confirm_completed', 'fail_and_retry', 'abandon_generation', 'resume']);
+export type RunRecoveryDecision = z.infer<typeof runRecoveryDecisionSchema>;
+export const recoveryRiskSchema = z.enum(['low', 'medium', 'high']);
+export type RecoveryRisk = z.infer<typeof recoveryRiskSchema>;
+export const recoveryCheckSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  status: z.enum(['passed', 'warning', 'unknown']),
+  detail: z.string().min(1)
+}).strict();
+export type RecoveryCheck = z.infer<typeof recoveryCheckSchema>;
+export const recoveryEvidenceSchema = z.object({
+  knownFacts: z.array(z.string()),
+  unknownFacts: z.array(z.string()),
+  checks: z.array(recoveryCheckSchema),
+  affectedResources: z.array(z.string()),
+  actionSummaries: z.array(z.string()),
+  currentHead: z.string().min(1).optional()
+}).strict();
+export type RecoveryEvidence = z.infer<typeof recoveryEvidenceSchema>;
+export const recoveryActionSchema = z.object({
+  decision: runRecoveryDecisionSchema,
+  label: z.string().min(1),
+  available: z.boolean(),
+  disabledReason: z.string().min(1).optional(),
+  risk: recoveryRiskSchema
+}).strict();
+export type RecoveryAction = z.infer<typeof recoveryActionSchema>;
+export const recoveryDecisionRecordSchema = z.object({
+  id: z.string().min(1),
+  runId: z.string().min(1),
+  generation: z.number().int().positive(),
+  decision: runRecoveryDecisionSchema,
+  actor: z.literal('local-user'),
+  note: z.string(),
+  fromState: runStateSchema,
+  toState: runStateSchema,
+  blockerCode: z.string().min(1),
+  evidence: recoveryEvidenceSchema,
+  result: z.enum(['applied', 'rejected']),
+  createdAt: z.string().min(1)
+}).strict();
+export type RecoveryDecisionRecord = z.infer<typeof recoveryDecisionRecordSchema>;
+export const runRecoveryRequestSchema = z.object({
+  decision: runRecoveryDecisionSchema,
+  note: z.string().max(20_000).optional()
+}).strict();
+
 export const createMessageRequestSchema = z.object({ content: z.string().min(1).max(100_000) }).strict();
 export const saveDocumentRequestSchema = z.object({
   docId: z.string().min(1).optional(),
@@ -605,6 +653,7 @@ export interface RunEvent<T = unknown> {
     | 'approval.requested'
     | 'approval.resolved'
     | 'budget.updated'
+    | 'recovery.decided'
     | 'doc.invalidated'
     | 'error';
   payload: T;
@@ -617,7 +666,7 @@ export interface RunEvent<T = unknown> {
 export const runEventSchema = z.object({
   id: z.number().int().nonnegative(),
   runId: z.string().min(1),
-  type: z.enum(['message.delta', 'message.completed', 'run.state', 'agent.state', 'task.state', 'task.result', 'artifact.updated', 'delivery.updated', 'tool.output', 'approval.requested', 'approval.resolved', 'budget.updated', 'doc.invalidated', 'error']),
+  type: z.enum(['message.delta', 'message.completed', 'run.state', 'agent.state', 'task.state', 'task.result', 'artifact.updated', 'delivery.updated', 'tool.output', 'approval.requested', 'approval.resolved', 'budget.updated', 'recovery.decided', 'doc.invalidated', 'error']),
   payload: z.unknown(),
   schemaVersion: z.literal(1),
   entityRevision: z.number().int().nonnegative(),
@@ -753,6 +802,21 @@ export const worktreeArtifactSchema = z.object({
   }
 });
 export type WorktreeArtifact = z.infer<typeof worktreeArtifactSchema>;
+
+export const runRecoverySummarySchema = z.object({
+  run: runSchema,
+  blocker: runBlockerSchema.optional(),
+  recoverable: z.boolean(),
+  actionAttempts: z.array(actionAttemptSchema),
+  unknownBudgetReservations: z.array(budgetReservationSchema),
+  worktreeArtifacts: z.array(worktreeArtifactSchema),
+  recentEvents: z.array(runEventSchema),
+  evidence: recoveryEvidenceSchema,
+  recoveryActions: z.array(recoveryActionSchema),
+  decisionHistory: z.array(recoveryDecisionRecordSchema),
+  createdAt: z.string().min(1)
+}).strict();
+export type RunRecoverySummary = z.infer<typeof runRecoverySummarySchema>;
 
 export const deliverySummarySchema = z.object({
   runId: z.string().min(1),
@@ -897,6 +961,7 @@ export const runEventV2Schema = z.discriminatedUnion('type', [
   z.object({ ...runEventV2Base, type: z.literal('budget.updated'), payload: z.object({ usage: runUsageSchema, reservation: budgetReservationSchema.optional() }).strict() }).strict(),
   z.object({ ...runEventV2Base, type: z.literal('operation.updated'), payload: z.object({ operation: operationAttemptSchema }).strict() }).strict(),
   z.object({ ...runEventV2Base, type: z.literal('acceptance.updated'), payload: z.object({ acceptance: acceptanceRecordSchema }).strict() }).strict(),
+  z.object({ ...runEventV2Base, type: z.literal('recovery.decided'), payload: z.object({ recovery: recoveryDecisionRecordSchema }).strict() }).strict(),
   z.object({ ...runEventV2Base, type: z.literal('doc.invalidated'), payload: z.object({ generation: z.number().int().positive(), documentId: z.string().min(1).optional(), reason: z.string().min(1) }).strict() }).strict(),
   z.object({ ...runEventV2Base, type: z.literal('error'), payload: z.object({ code: z.string().min(1), message: z.string(), details: z.record(z.unknown()).optional() }).strict() }).strict()
 ]);
